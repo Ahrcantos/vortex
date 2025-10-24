@@ -26,6 +26,7 @@ struct App {
     swap_chain_images: Option<Vec<vk::Image>>,
     image_views: Option<Vec<vk::ImageView>>,
     pipeline: vk::Pipeline,
+    render_pass: Option<vk::RenderPass>,
 }
 
 impl App {
@@ -42,9 +43,7 @@ impl App {
                 .engine_version(vk::make_api_version(0, 0, 0, 1))
                 .api_version(vk::API_VERSION_1_0);
 
-            let layer_names = &[{ c"VK_LAYER_LUNARG_standard_validation".as_ptr() }, {
-                c"VK_LAYER_RENDERDOC_Capture".as_ptr()
-            }];
+            let layer_names = &[{ c"VK_LAYER_KHRONOS_validation".as_ptr() }];
 
             let extension_names = ash_window::enumerate_required_extensions(
                 event_loop
@@ -53,6 +52,9 @@ impl App {
                     .as_raw(),
             )
             .expect("Failed to enumerate required extensions");
+
+            // let layer_properties = unsafe { entry.enumerate_instance_layer_properties().unwrap() };
+            // dbg!(layer_properties);
 
             let create_info = vk::InstanceCreateInfo::default()
                 .flags(vk::InstanceCreateFlags::empty())
@@ -104,7 +106,7 @@ impl App {
         let graphics_queue = unsafe { device.get_device_queue(0, 0) };
         let present_queue = unsafe { device.get_device_queue(0, 0) };
 
-        let graphics_pipeline = {
+        let (graphics_pipeline, render_pass) = {
             let vertex_shader =
                 create_shader_module(&device, include_bytes!("../shaders/vert.spv"));
 
@@ -250,7 +252,7 @@ impl App {
                 device.destroy_shader_module(fragment_shader, None);
             }
 
-            pipeline
+            (pipeline, render_pass)
         };
 
         // instance.get_physical_device_surface_
@@ -268,6 +270,7 @@ impl App {
             swap_chain_images: None,
             image_views: None,
             pipeline: graphics_pipeline,
+            render_pass: Some(render_pass),
         }
     }
 }
@@ -286,7 +289,9 @@ fn is_device_suitable(instance: &ash::Instance, device: vk::PhysicalDevice) -> b
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = event_loop
-            .create_window(Window::default_attributes().with_inner_size(PhysicalSize::new(10, 10)))
+            .create_window(
+                Window::default_attributes().with_inner_size(PhysicalSize::new(800, 600)),
+            )
             .unwrap();
 
         let surface = unsafe {
@@ -340,6 +345,7 @@ impl ApplicationHandler for App {
                 .clipped(true)
                 .flags(vk::SwapchainCreateFlagsKHR::empty())
                 .surface(surface)
+                .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
                 .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT);
 
             let instance = ash::khr::swapchain::Device::new(&self.instance, &self.device);
@@ -385,6 +391,28 @@ impl ApplicationHandler for App {
                     self.device
                         .create_image_view(&create_info, None)
                         .expect("Failed to create image view")
+                }
+            })
+            .collect();
+
+        // Look up if cloning for vulkan objects is an expensive operation or if they
+        // are just references
+        let frame_buffers: Vec<_> = image_views
+            .clone()
+            .into_iter()
+            .map(|image| {
+                let attachments = &[image];
+                let create_info = vk::FramebufferCreateInfo::default()
+                    .render_pass(self.render_pass.expect("Render pass not yet created"))
+                    .attachments(attachments)
+                    .width(800)
+                    .height(600)
+                    .layers(1);
+
+                unsafe {
+                    self.device
+                        .create_framebuffer(&create_info, None)
+                        .expect("Failed to create frame buffer")
                 }
             })
             .collect();
