@@ -1,9 +1,6 @@
-use std::ffi::CString;
+use std::{ffi::CString, u64, usize};
 
-use ash::{
-    Entry,
-    vk::{self, KHR_DISPLAY_NAME},
-};
+use ash::{Entry, vk};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -13,20 +10,30 @@ use winit::{
     window::{Window, WindowId},
 };
 
+const WIDTH: u32 = 1908;
+const HEIGHT: u32 = 522;
+
 struct App {
     window: Option<Window>,
     entry: ash::Entry,
     instance: ash::Instance,
-    physical_device: vk::PhysicalDevice,
+    _physical_device: vk::PhysicalDevice,
     device: ash::Device,
-    _graphics_queue: vk::Queue,
-    _present_queue: vk::Queue,
+    graphics_queue: vk::Queue,
+    present_queue: vk::Queue,
     surface: Option<vk::SurfaceKHR>,
     swap_chain: Option<vk::SwapchainKHR>,
     swap_chain_images: Option<Vec<vk::Image>>,
     image_views: Option<Vec<vk::ImageView>>,
     pipeline: vk::Pipeline,
     render_pass: Option<vk::RenderPass>,
+    _command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    frame_buffers: Option<Vec<vk::Framebuffer>>,
+    image_available_semaphore: vk::Semaphore,
+    render_finished_semaphore: vk::Semaphore,
+    in_flight_fence: vk::Fence,
+    window_size: PhysicalSize<u32>,
 }
 
 impl App {
@@ -53,8 +60,8 @@ impl App {
             )
             .expect("Failed to enumerate required extensions");
 
-            // let layer_properties = unsafe { entry.enumerate_instance_layer_properties().unwrap() };
-            // dbg!(layer_properties);
+            let layer_properties = unsafe { entry.enumerate_instance_layer_properties().unwrap() };
+            dbg!(layer_properties);
 
             let create_info = vk::InstanceCreateInfo::default()
                 .flags(vk::InstanceCreateFlags::empty())
@@ -134,14 +141,6 @@ impl App {
                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
                 .primitive_restart_enable(false);
 
-            let viewport = vk::Viewport::default()
-                .x(0.0)
-                .y(0.0)
-                .width(600.0) // TODO: Take the widht and height of the swapchain
-                .height(800.0)
-                .min_depth(0.0)
-                .max_depth(1.0);
-
             let viewport_state = vk::PipelineViewportStateCreateInfo::default()
                 .viewport_count(1)
                 .scissor_count(1);
@@ -208,9 +207,20 @@ impl App {
                 let color_attachments = &[color_attachment];
                 let subpasses = &[subpass];
 
+                let dependency = vk::SubpassDependency::default()
+                    .src_subpass(vk::SUBPASS_EXTERNAL)
+                    .dst_subpass(0)
+                    .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+
+                let dependencies = &[dependency];
+
                 let create_info = vk::RenderPassCreateInfo::default()
                     .attachments(color_attachments)
-                    .subpasses(subpasses);
+                    .subpasses(subpasses)
+                    .dependencies(dependencies);
 
                 unsafe {
                     device
@@ -255,79 +265,188 @@ impl App {
             (pipeline, render_pass)
         };
 
-        // instance.get_physical_device_surface_
+        let command_pool = {
+            let create_info = vk::CommandPoolCreateInfo::default()
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                .queue_family_index(0);
+
+            unsafe {
+                device
+                    .create_command_pool(&create_info, None)
+                    .expect("Failed to create command pool")
+            }
+        };
+
+        let command_buffer = {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+
+            unsafe {
+                device
+                    .allocate_command_buffers(&alloc_info)
+                    .expect("Failed to create command buffer")
+                    .pop()
+                    .expect("No command buffers created")
+            }
+        };
+
+        let image_available_semaphore = unsafe {
+            device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                .expect("Failed to create semaphore")
+        };
+
+        let render_finished_semaphore = unsafe {
+            device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                .expect("Failed to create semaphore")
+        };
+
+        let in_flight_fence = unsafe {
+            device
+                .create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+                .expect("Failed to create fence")
+        };
 
         Self {
             window: None,
             surface: None,
             entry,
             instance,
-            physical_device,
+            _physical_device: physical_device,
             device,
-            _graphics_queue: graphics_queue,
-            _present_queue: present_queue,
+            graphics_queue,
+            present_queue,
             swap_chain: None,
             swap_chain_images: None,
             image_views: None,
             pipeline: graphics_pipeline,
             render_pass: Some(render_pass),
+            _command_pool: command_pool.clone(),
+            command_buffer,
+            frame_buffers: None,
+            image_available_semaphore,
+            render_finished_semaphore,
+            in_flight_fence,
+            window_size: PhysicalSize {
+                width: WIDTH,
+                height: HEIGHT,
+            },
         }
     }
-}
 
-fn is_device_suitable(instance: &ash::Instance, device: vk::PhysicalDevice) -> bool {
-    let device_properties = unsafe { instance.get_physical_device_properties(device) };
-    let device_features = unsafe { instance.get_physical_device_features(device) };
+    fn record_command_buffer(&self, command_buffer: vk::CommandBuffer, image_index: u32) {
+        let begin_info = vk::CommandBufferBeginInfo::default();
 
-    // let exts = unsafe { instance.enumerate_device_extension_properties(device) };
-    // dbg!(exts);
+        unsafe {
+            self.device
+                .begin_command_buffer(command_buffer, &begin_info)
+                .expect("Failed to begin command buffer")
+        }
 
-    device_properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
-        && device_features.geometry_shader == 1
-}
+        let frame_buffer = self.frame_buffers.as_ref().unwrap().clone()[image_index as usize];
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window = event_loop
-            .create_window(
-                Window::default_attributes().with_inner_size(PhysicalSize::new(800, 600)),
+        let render_pass_begin_info = vk::RenderPassBeginInfo::default()
+            .render_pass(self.render_pass.unwrap().clone())
+            .framebuffer(frame_buffer)
+            .render_area(
+                vk::Rect2D::default()
+                    .extent(vk::Extent2D {
+                        width: self.window_size.width,
+                        height: self.window_size.height,
+                    })
+                    .offset(vk::Offset2D { x: 0, y: 0 }),
             )
-            .unwrap();
+            .clear_values(&[vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                },
+            }]);
 
-        let surface = unsafe {
-            ash_window::create_surface(
-                &self.entry,
-                &self.instance,
-                window.display_handle().unwrap().as_raw(),
-                window.window_handle().unwrap().as_raw(),
-                None,
-            )
-            .expect("Failed to create surface")
+        unsafe {
+            self.device.cmd_begin_render_pass(
+                command_buffer,
+                &render_pass_begin_info,
+                vk::SubpassContents::INLINE,
+            );
         };
 
-        {
-            let instance = ash::khr::surface::Instance::new(&self.entry, &self.instance);
-            let surface_capabilities = unsafe {
-                instance
-                    .get_physical_device_surface_capabilities(self.physical_device, surface)
-                    .expect("Failed to get device surface capabilities")
-            };
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline,
+            );
+        };
 
-            let surface_formats = unsafe {
-                instance
-                    .get_physical_device_surface_formats(self.physical_device, surface)
-                    .expect("Failed to get surface formats")
-            };
+        let viewport = vk::Viewport::default()
+            .x(0.0)
+            .y(0.0)
+            .width(self.window_size.width as f32) // TODO: Take the widht and height of the swapchain
+            .height(self.window_size.height as f32)
+            .min_depth(0.0)
+            .max_depth(1.0);
 
-            let surface_presentation_modes = unsafe {
-                instance
-                    .get_physical_device_surface_present_modes(self.physical_device, surface)
-                    .expect("Failed to get surface present modes")
-            };
+        unsafe {
+            self.device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+        };
 
-            dbg!(surface_capabilities);
-            dbg!(surface_formats);
-            dbg!(surface_presentation_modes);
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: self.window_size.width,
+                height: self.window_size.height,
+            },
+        };
+
+        unsafe {
+            self.device.cmd_set_scissor(command_buffer, 0, &[scissor]);
+        }
+
+        unsafe {
+            self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        }
+
+        unsafe {
+            self.device.cmd_end_render_pass(command_buffer);
+        }
+
+        unsafe {
+            self.device
+                .end_command_buffer(command_buffer)
+                .expect("Failed to record command buffer");
+        }
+    }
+
+    fn create_swapchain(
+        &mut self,
+    ) -> (
+        vk::SwapchainKHR,
+        Vec<vk::Image>,
+        Vec<vk::ImageView>,
+        Vec<vk::Framebuffer>,
+    ) {
+        // Create the surface if it has not been created already
+        if let Some(window) = &self.window {
+            if self.surface.is_none() {
+                let surface = unsafe {
+                    ash_window::create_surface(
+                        &self.entry,
+                        &self.instance,
+                        window.display_handle().unwrap().as_raw(),
+                        window.window_handle().unwrap().as_raw(),
+                        None,
+                    )
+                    .expect("Failed to create surface")
+                };
+
+                self.surface = Some(surface);
+            }
         }
 
         let (swap_chain, swap_chain_images) = {
@@ -336,15 +455,15 @@ impl ApplicationHandler for App {
                 .image_format(vk::Format::B8G8R8A8_SRGB)
                 .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
                 .image_extent(vk::Extent2D {
-                    width: 800,
-                    height: 600,
+                    width: self.window_size.width,
+                    height: self.window_size.height,
                 })
                 .image_array_layers(1)
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
                 .clipped(true)
                 .flags(vk::SwapchainCreateFlagsKHR::empty())
-                .surface(surface)
+                .surface(self.surface.expect("Surface should be created"))
                 .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
                 .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT);
 
@@ -405,8 +524,8 @@ impl ApplicationHandler for App {
                 let create_info = vk::FramebufferCreateInfo::default()
                     .render_pass(self.render_pass.expect("Render pass not yet created"))
                     .attachments(attachments)
-                    .width(800)
-                    .height(600)
+                    .width(self.window_size.width)
+                    .height(self.window_size.height)
                     .layers(1);
 
                 unsafe {
@@ -417,29 +536,201 @@ impl ApplicationHandler for App {
             })
             .collect();
 
-        self.window = Some(window);
-        self.surface = Some(surface);
-        self.swap_chain = Some(swap_chain);
-        self.swap_chain_images = Some(swap_chain_images);
-        self.image_views = Some(image_views)
+        (swap_chain, swap_chain_images, image_views, frame_buffers)
     }
 
-    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
-        self.swap_chain = None;
+    fn cleanup_swapchain(&mut self) {
+        if let Some(frame_buffers) = self.frame_buffers.take() {
+            for framebuffer in frame_buffers {
+                unsafe { self.device.destroy_framebuffer(framebuffer, None) };
+            }
+        }
+
+        if let Some(image_views) = self.image_views.take() {
+            for image_view in image_views {
+                unsafe {
+                    self.device.destroy_image_view(image_view, None);
+                }
+            }
+        }
+
+        if let Some(swapchain) = self.swap_chain.take() {
+            let device = ash::khr::swapchain::Device::new(&self.instance, &self.device);
+
+            unsafe {
+                device.destroy_swapchain(swapchain, None);
+            };
+        }
+    }
+}
+
+fn is_device_suitable(instance: &ash::Instance, device: vk::PhysicalDevice) -> bool {
+    let device_properties = unsafe { instance.get_physical_device_properties(device) };
+    let device_features = unsafe { instance.get_physical_device_features(device) };
+
+    // let exts = unsafe { instance.enumerate_device_extension_properties(device) };
+    // dbg!(exts);
+
+    device_properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
+        && device_features.geometry_shader == 1
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let window = event_loop
+            .create_window(
+                Window::default_attributes().with_inner_size(PhysicalSize::new(800, 600)),
+            )
+            .unwrap();
+
+        // {
+        //     let instance = ash::khr::surface::Instance::new(&self.entry, &self.instance);
+        //     let surface_capabilities = unsafe {
+        //         instance
+        //             .get_physical_device_surface_capabilities(self.physical_device, surface)
+        //             .expect("Failed to get device surface capabilities")
+        //     };
+
+        //     let surface_formats = unsafe {
+        //         instance
+        //             .get_physical_device_surface_formats(self.physical_device, surface)
+        //             .expect("Failed to get surface formats")
+        //     };
+
+        //     let surface_presentation_modes = unsafe {
+        //         instance
+        //             .get_physical_device_surface_present_modes(self.physical_device, surface)
+        //             .expect("Failed to get surface present modes")
+        //     };
+
+        //     dbg!(surface_capabilities);
+        //     dbg!(surface_formats);
+        //     dbg!(surface_presentation_modes);
+        // }
+
+        self.window = Some(window);
+    }
+
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.cleanup_swapchain();
     }
 
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        window_id: WindowId,
+        _window_id: WindowId,
         event: WindowEvent,
     ) {
         match event {
             WindowEvent::CloseRequested => {
+                // Wait for rendering to finish and only then clean up
+                unsafe { self.device.device_wait_idle().expect("Failed to wait") };
+
                 event_loop.exit();
             }
 
+            WindowEvent::Resized(size) => {
+                unsafe {
+                    self.device.device_wait_idle().expect("Failed to wait");
+                }
+
+                self.cleanup_swapchain();
+                self.window_size = size;
+
+                let (swapchain, swapchain_images, image_views, frame_buffers) =
+                    self.create_swapchain();
+
+                self.swap_chain = Some(swapchain);
+                self.swap_chain_images = Some(swapchain_images);
+                self.image_views = Some(image_views);
+                self.frame_buffers = Some(frame_buffers);
+            }
+
             WindowEvent::RedrawRequested => {
+                // Wait for the last frame to be fully drawn
+                unsafe {
+                    self.device
+                        .wait_for_fences(&[self.in_flight_fence], true, u64::MAX)
+                        .expect("Failed to wait for fence");
+                };
+
+                unsafe {
+                    self.device
+                        .reset_fences(&[self.in_flight_fence])
+                        .expect("Failed to reset fence");
+                };
+
+                // Aquire next image from the swap chain
+                // The returned image index is an index into swap chain images
+                // for which we need to pick the associated frame buffer
+
+                let image_index = {
+                    let device = ash::khr::swapchain::Device::new(&self.instance, &self.device);
+                    let (image_index, _) = unsafe {
+                        device
+                            .acquire_next_image(
+                                self.swap_chain.expect("Swap chain not present"),
+                                u64::MAX,
+                                self.image_available_semaphore,
+                                vk::Fence::null(),
+                            )
+                            .expect("Failed to aquire next image")
+                    };
+
+                    image_index
+                };
+
+                // Recording the command buffer
+                unsafe {
+                    self.device
+                        .reset_command_buffer(
+                            self.command_buffer,
+                            vk::CommandBufferResetFlags::empty(),
+                        )
+                        .expect("Failed to reset command buffer");
+                };
+                self.record_command_buffer(self.command_buffer, image_index);
+
+                // Submitting command buffer
+                {
+                    let wait_semaphores = &[self.image_available_semaphore];
+                    let signal_semaphores = &[self.render_finished_semaphore];
+                    let wait_stages: &[vk::PipelineStageFlags] =
+                        &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                    let command_buffers = &[self.command_buffer];
+
+                    let submit_info = vk::SubmitInfo::default()
+                        .wait_semaphores(wait_semaphores)
+                        .wait_dst_stage_mask(wait_stages)
+                        .command_buffers(command_buffers)
+                        .signal_semaphores(signal_semaphores);
+
+                    unsafe {
+                        self.device
+                            .queue_submit(self.graphics_queue, &[submit_info], self.in_flight_fence)
+                            .expect("Failed to submit to queue")
+                    }
+                };
+
+                // Submit final image back to swap chain (present)
+                {
+                    let signal_semaphores = &[self.render_finished_semaphore];
+                    let swapchains = &[self.swap_chain.expect("No swap chain defined")];
+                    let image_indicies = &[image_index];
+                    let present_info = vk::PresentInfoKHR::default()
+                        .wait_semaphores(signal_semaphores)
+                        .swapchains(swapchains)
+                        .image_indices(image_indicies);
+
+                    let device = ash::khr::swapchain::Device::new(&self.instance, &self.device);
+
+                    unsafe {
+                        device
+                            .queue_present(self.present_queue, &present_info)
+                            .expect("Failed to present")
+                    };
+                };
+
                 self.window.as_ref().unwrap().request_redraw();
             }
             _ => (),
@@ -461,12 +752,6 @@ fn create_shader_module(device: &ash::Device, code: &[u8]) -> vk::ShaderModule {
     };
 
     shader_module
-}
-
-impl App {
-    pub fn main_loop(event_loop: &EventLoop<()>) {
-        todo!()
-    }
 }
 
 fn main() {
