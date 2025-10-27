@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 ash = { version = "0.38.0", features = ["linked"] }
 ash-window = "0.13.0"
+bevy_ecs = "0.16.1"
 winit = "0.30.12"

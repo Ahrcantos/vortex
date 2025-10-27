@@ -1,6 +1,7 @@
 use std::{ffi::CString, u64, usize};
 
 use ash::{Entry, vk};
+use bevy_ecs::{change_detection::Res, resource::Resource, schedule::Schedule, world::World};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -10,31 +11,32 @@ use winit::{
     window::{Window, WindowId},
 };
 
-const WIDTH: u32 = 1908;
-const HEIGHT: u32 = 522;
+const WIDTH: u32 = 800;
+const HEIGHT: u32 = 600;
 
 struct App {
     window: Option<Window>,
     entry: ash::Entry,
     instance: ash::Instance,
-    _physical_device: vk::PhysicalDevice,
+    physical_device: vk::PhysicalDevice,
     device: ash::Device,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
-    surface: Option<vk::SurfaceKHR>,
-    swap_chain: Option<vk::SwapchainKHR>,
-    swap_chain_images: Option<Vec<vk::Image>>,
-    image_views: Option<Vec<vk::ImageView>>,
     pipeline: vk::Pipeline,
-    render_pass: Option<vk::RenderPass>,
+    render_pass: vk::RenderPass,
     _command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
-    frame_buffers: Option<Vec<vk::Framebuffer>>,
     image_available_semaphore: vk::Semaphore,
     render_finished_semaphore: vk::Semaphore,
     in_flight_fence: vk::Fence,
     window_size: PhysicalSize<u32>,
+    schedule: Schedule,
+    world: World,
+    swapchain_data: Option<SwapchainData>,
 }
+
+#[derive(Resource, Default)]
+struct FrameCounter(usize);
 
 impl App {
     pub fn new<T>(event_loop: &EventLoop<T>) -> Self {
@@ -59,9 +61,6 @@ impl App {
                     .as_raw(),
             )
             .expect("Failed to enumerate required extensions");
-
-            let layer_properties = unsafe { entry.enumerate_instance_layer_properties().unwrap() };
-            dbg!(layer_properties);
 
             let create_info = vk::InstanceCreateInfo::default()
                 .flags(vk::InstanceCreateFlags::empty())
@@ -313,23 +312,24 @@ impl App {
                 .expect("Failed to create fence")
         };
 
+        let mut world = World::new();
+        world.insert_resource(FrameCounter::default());
+        let mut schedule = Schedule::default();
+
+        schedule.add_systems(print_frame_count);
+
         Self {
             window: None,
-            surface: None,
             entry,
             instance,
-            _physical_device: physical_device,
+            physical_device,
             device,
             graphics_queue,
             present_queue,
-            swap_chain: None,
-            swap_chain_images: None,
-            image_views: None,
             pipeline: graphics_pipeline,
-            render_pass: Some(render_pass),
+            render_pass,
             _command_pool: command_pool.clone(),
             command_buffer,
-            frame_buffers: None,
             image_available_semaphore,
             render_finished_semaphore,
             in_flight_fence,
@@ -337,6 +337,9 @@ impl App {
                 width: WIDTH,
                 height: HEIGHT,
             },
+            world,
+            schedule,
+            swapchain_data: None,
         }
     }
 
@@ -349,10 +352,11 @@ impl App {
                 .expect("Failed to begin command buffer")
         }
 
-        let frame_buffer = self.frame_buffers.as_ref().unwrap().clone()[image_index as usize];
+        let frame_buffer =
+            self.swapchain_data.as_ref().unwrap().framebuffers.clone()[image_index as usize];
 
         let render_pass_begin_info = vk::RenderPassBeginInfo::default()
-            .render_pass(self.render_pass.unwrap().clone())
+            .render_pass(self.render_pass.clone())
             .framebuffer(frame_buffer)
             .render_area(
                 vk::Rect2D::default()
@@ -422,154 +426,11 @@ impl App {
                 .expect("Failed to record command buffer");
         }
     }
-
-    fn create_swapchain(
-        &mut self,
-    ) -> (
-        vk::SwapchainKHR,
-        Vec<vk::Image>,
-        Vec<vk::ImageView>,
-        Vec<vk::Framebuffer>,
-    ) {
-        // Create the surface if it has not been created already
-        if let Some(window) = &self.window {
-            if self.surface.is_none() {
-                let surface = unsafe {
-                    ash_window::create_surface(
-                        &self.entry,
-                        &self.instance,
-                        window.display_handle().unwrap().as_raw(),
-                        window.window_handle().unwrap().as_raw(),
-                        None,
-                    )
-                    .expect("Failed to create surface")
-                };
-
-                self.surface = Some(surface);
-            }
-        }
-
-        let (swap_chain, swap_chain_images) = {
-            let create_info = vk::SwapchainCreateInfoKHR::default()
-                .min_image_count(2)
-                .image_format(vk::Format::B8G8R8A8_SRGB)
-                .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
-                .image_extent(vk::Extent2D {
-                    width: self.window_size.width,
-                    height: self.window_size.height,
-                })
-                .image_array_layers(1)
-                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                .clipped(true)
-                .flags(vk::SwapchainCreateFlagsKHR::empty())
-                .surface(self.surface.expect("Surface should be created"))
-                .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
-                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT);
-
-            let instance = ash::khr::swapchain::Device::new(&self.instance, &self.device);
-            let swap_chain = unsafe {
-                instance
-                    .create_swapchain(&create_info, None)
-                    .expect("Failed to create swapchain")
-            };
-
-            let swap_chain_images = unsafe {
-                instance
-                    .get_swapchain_images(swap_chain)
-                    .expect("Failed to get swap chain images")
-            };
-
-            (swap_chain, swap_chain_images)
-        };
-
-        let image_views: Vec<_> = swap_chain_images
-            .iter()
-            .map(|image| {
-                let create_info = vk::ImageViewCreateInfo::default()
-                    .image(image.clone())
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::B8G8R8A8_SRGB)
-                    .components(
-                        vk::ComponentMapping::default()
-                            .r(vk::ComponentSwizzle::IDENTITY)
-                            .g(vk::ComponentSwizzle::IDENTITY)
-                            .b(vk::ComponentSwizzle::IDENTITY)
-                            .a(vk::ComponentSwizzle::IDENTITY),
-                    )
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
-                            .level_count(1)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    );
-
-                unsafe {
-                    self.device
-                        .create_image_view(&create_info, None)
-                        .expect("Failed to create image view")
-                }
-            })
-            .collect();
-
-        // Look up if cloning for vulkan objects is an expensive operation or if they
-        // are just references
-        let frame_buffers: Vec<_> = image_views
-            .clone()
-            .into_iter()
-            .map(|image| {
-                let attachments = &[image];
-                let create_info = vk::FramebufferCreateInfo::default()
-                    .render_pass(self.render_pass.expect("Render pass not yet created"))
-                    .attachments(attachments)
-                    .width(self.window_size.width)
-                    .height(self.window_size.height)
-                    .layers(1);
-
-                unsafe {
-                    self.device
-                        .create_framebuffer(&create_info, None)
-                        .expect("Failed to create frame buffer")
-                }
-            })
-            .collect();
-
-        (swap_chain, swap_chain_images, image_views, frame_buffers)
-    }
-
-    fn cleanup_swapchain(&mut self) {
-        if let Some(frame_buffers) = self.frame_buffers.take() {
-            for framebuffer in frame_buffers {
-                unsafe { self.device.destroy_framebuffer(framebuffer, None) };
-            }
-        }
-
-        if let Some(image_views) = self.image_views.take() {
-            for image_view in image_views {
-                unsafe {
-                    self.device.destroy_image_view(image_view, None);
-                }
-            }
-        }
-
-        if let Some(swapchain) = self.swap_chain.take() {
-            let device = ash::khr::swapchain::Device::new(&self.instance, &self.device);
-
-            unsafe {
-                device.destroy_swapchain(swapchain, None);
-            };
-        }
-    }
 }
 
 fn is_device_suitable(instance: &ash::Instance, device: vk::PhysicalDevice) -> bool {
     let device_properties = unsafe { instance.get_physical_device_properties(device) };
     let device_features = unsafe { instance.get_physical_device_features(device) };
-
-    // let exts = unsafe { instance.enumerate_device_extension_properties(device) };
-    // dbg!(exts);
 
     device_properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
         && device_features.geometry_shader == 1
@@ -579,40 +440,26 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = event_loop
             .create_window(
-                Window::default_attributes().with_inner_size(PhysicalSize::new(800, 600)),
+                Window::default_attributes().with_inner_size(PhysicalSize::new(WIDTH, HEIGHT)),
             )
             .unwrap();
 
-        // {
-        //     let instance = ash::khr::surface::Instance::new(&self.entry, &self.instance);
-        //     let surface_capabilities = unsafe {
-        //         instance
-        //             .get_physical_device_surface_capabilities(self.physical_device, surface)
-        //             .expect("Failed to get device surface capabilities")
-        //     };
-
-        //     let surface_formats = unsafe {
-        //         instance
-        //             .get_physical_device_surface_formats(self.physical_device, surface)
-        //             .expect("Failed to get surface formats")
-        //     };
-
-        //     let surface_presentation_modes = unsafe {
-        //         instance
-        //             .get_physical_device_surface_present_modes(self.physical_device, surface)
-        //             .expect("Failed to get surface present modes")
-        //     };
-
-        //     dbg!(surface_capabilities);
-        //     dbg!(surface_formats);
-        //     dbg!(surface_presentation_modes);
-        // }
+        let swapchain_data = SwapchainData::setup(
+            &self.entry,
+            &self.instance,
+            self.physical_device.clone(),
+            &self.device,
+            self.render_pass.clone(),
+            &window,
+        );
 
         self.window = Some(window);
+        self.swapchain_data = Some(swapchain_data);
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        self.cleanup_swapchain();
+        dbg!("Suspended");
+        // self.cleanup_swapchain();
     }
 
     fn window_event(
@@ -634,16 +481,18 @@ impl ApplicationHandler for App {
                     self.device.device_wait_idle().expect("Failed to wait");
                 }
 
-                self.cleanup_swapchain();
                 self.window_size = size;
 
-                let (swapchain, swapchain_images, image_views, frame_buffers) =
-                    self.create_swapchain();
-
-                self.swap_chain = Some(swapchain);
-                self.swap_chain_images = Some(swapchain_images);
-                self.image_views = Some(image_views);
-                self.frame_buffers = Some(frame_buffers);
+                if let Some(swapchain) = &mut self.swapchain_data {
+                    swapchain.recreate(
+                        &self.entry,
+                        &self.instance,
+                        self.physical_device,
+                        &self.device,
+                        self.render_pass,
+                        self.window.as_ref().expect("Window not present"),
+                    );
+                }
             }
 
             WindowEvent::RedrawRequested => {
@@ -669,7 +518,10 @@ impl ApplicationHandler for App {
                     let (image_index, _) = unsafe {
                         device
                             .acquire_next_image(
-                                self.swap_chain.expect("Swap chain not present"),
+                                self.swapchain_data
+                                    .as_ref()
+                                    .expect("Swap chain data not present")
+                                    .swapchain,
                                 u64::MAX,
                                 self.image_available_semaphore,
                                 vk::Fence::null(),
@@ -679,6 +531,15 @@ impl ApplicationHandler for App {
 
                     image_index
                 };
+
+                let mut frame_counter = self
+                    .world
+                    .get_resource_mut::<FrameCounter>()
+                    .expect("Frame Count not found");
+
+                frame_counter.0 += 1;
+
+                self.schedule.run(&mut self.world);
 
                 // Recording the command buffer
                 unsafe {
@@ -715,7 +576,12 @@ impl ApplicationHandler for App {
                 // Submit final image back to swap chain (present)
                 {
                     let signal_semaphores = &[self.render_finished_semaphore];
-                    let swapchains = &[self.swap_chain.expect("No swap chain defined")];
+                    let swapchains = &[self
+                        .swapchain_data
+                        .as_ref()
+                        .expect("No swap chain defined")
+                        .swapchain
+                        .clone()];
                     let image_indicies = &[image_index];
                     let present_info = vk::PresentInfoKHR::default()
                         .wait_semaphores(signal_semaphores)
@@ -754,10 +620,323 @@ fn create_shader_module(device: &ash::Device, code: &[u8]) -> vk::ShaderModule {
     shader_module
 }
 
+fn print_frame_count(frame_counter: Res<FrameCounter>) {
+    // println!("Frame {}", frame_counter.0);
+}
+
 fn main() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::new(&event_loop);
-    event_loop.run_app(&mut app);
+    event_loop.run_app(&mut app).expect("Failed to run app");
+}
+
+struct SwapchainData {
+    pub surface: vk::SurfaceKHR,
+    pub swapchain: vk::SwapchainKHR,
+    pub images: Vec<vk::Image>,
+    pub image_views: Vec<vk::ImageView>,
+    pub framebuffers: Vec<vk::Framebuffer>,
+    pub surface_format: vk::SurfaceFormatKHR,
+    pub presentation_mode: vk::PresentModeKHR,
+}
+
+impl SwapchainData {
+    pub fn setup(
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &ash::Device,
+        render_pass: vk::RenderPass,
+        window: &Window,
+    ) -> Self {
+        let surface = unsafe {
+            ash_window::create_surface(
+                entry,
+                instance,
+                window.display_handle().unwrap().as_raw(),
+                window.window_handle().unwrap().as_raw(),
+                None,
+            )
+            .expect("Failed to create surface")
+        };
+
+        let khr_instance = ash::khr::surface::Instance::new(entry, instance);
+        let surface_capabilities = unsafe {
+            khr_instance
+                .get_physical_device_surface_capabilities(physical_device, surface)
+                .expect("Failed to get device surface capabilities")
+        };
+
+        let surface_formats = unsafe {
+            khr_instance
+                .get_physical_device_surface_formats(physical_device, surface)
+                .expect("Failed to get surface formats")
+        };
+
+        let presentation_mode = {
+            let surface_presentation_modes = unsafe {
+                khr_instance
+                    .get_physical_device_surface_present_modes(physical_device, surface)
+                    .expect("Failed to get surface present modes")
+            };
+
+            surface_presentation_modes
+                .into_iter()
+                .find(|mode| *mode == vk::PresentModeKHR::MAILBOX)
+                .unwrap_or(vk::PresentModeKHR::FIFO)
+        };
+
+        let surface_format = surface_formats
+            .iter()
+            .find(|format| {
+                format.format == vk::Format::B8G8R8A8_SRGB
+                    && format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+            })
+            .and_then(|format| Some(format.clone()))
+            .unwrap_or(surface_formats[0].clone());
+
+        let extend = Self::choose_swap_extend(&surface_capabilities);
+
+        let khr_device = ash::khr::swapchain::Device::new(instance, device);
+
+        let (swapchain, swapchain_images) = {
+            let create_info = vk::SwapchainCreateInfoKHR::default()
+                .present_mode(presentation_mode)
+                .min_image_count(2)
+                .image_format(surface_format.format)
+                .image_color_space(surface_format.color_space)
+                .image_extent(extend)
+                .image_array_layers(1)
+                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                .clipped(true)
+                .flags(vk::SwapchainCreateFlagsKHR::empty())
+                .surface(surface)
+                .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT);
+
+            let swapchain = unsafe {
+                khr_device
+                    .create_swapchain(&create_info, None)
+                    .expect("Failed to create swapchain")
+            };
+
+            let swapchain_images = unsafe {
+                khr_device
+                    .get_swapchain_images(swapchain)
+                    .expect("Failed to get swap chain images")
+            };
+
+            (swapchain, swapchain_images)
+        };
+
+        let image_views: Vec<_> = swapchain_images
+            .iter()
+            .map(|image| {
+                let create_info = vk::ImageViewCreateInfo::default()
+                    .image(image.clone())
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::B8G8R8A8_SRGB)
+                    .components(
+                        vk::ComponentMapping::default()
+                            .r(vk::ComponentSwizzle::IDENTITY)
+                            .g(vk::ComponentSwizzle::IDENTITY)
+                            .b(vk::ComponentSwizzle::IDENTITY)
+                            .a(vk::ComponentSwizzle::IDENTITY),
+                    )
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    );
+
+                unsafe {
+                    device
+                        .create_image_view(&create_info, None)
+                        .expect("Failed to create image view")
+                }
+            })
+            .collect();
+
+        // Look up if cloning for vulkan objects is an expensive operation or if they
+        // are just references
+        let framebuffers: Vec<_> = image_views
+            .clone()
+            .into_iter()
+            .map(|image| {
+                let attachments = &[image];
+                let create_info = vk::FramebufferCreateInfo::default()
+                    .render_pass(render_pass)
+                    .attachments(attachments)
+                    .width(extend.width)
+                    .height(extend.height)
+                    .layers(1);
+
+                unsafe {
+                    device
+                        .create_framebuffer(&create_info, None)
+                        .expect("Failed to create frame buffer")
+                }
+            })
+            .collect();
+
+        Self {
+            surface,
+            swapchain,
+            images: swapchain_images,
+            image_views,
+            framebuffers,
+            presentation_mode,
+            surface_format,
+        }
+    }
+
+    pub fn recreate(
+        &mut self,
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &ash::Device,
+        render_pass: vk::RenderPass,
+        window: &Window,
+    ) {
+        let khr_instance = ash::khr::surface::Instance::new(entry, instance);
+        let khr_device = ash::khr::swapchain::Device::new(instance, device);
+
+        unsafe {
+            khr_device.destroy_swapchain(self.swapchain, None);
+        };
+
+        // Recreate
+
+        let surface = unsafe {
+            ash_window::create_surface(
+                entry,
+                instance,
+                window.display_handle().unwrap().as_raw(),
+                window.window_handle().unwrap().as_raw(),
+                None,
+            )
+            .expect("Failed to create surface")
+        };
+
+        let surface_capabilities = unsafe {
+            khr_instance
+                .get_physical_device_surface_capabilities(physical_device, surface)
+                .expect("Failed to get device surface capabilities")
+        };
+
+        let extend = Self::choose_swap_extend(&surface_capabilities);
+
+        let (swapchain, swapchain_images) = {
+            let create_info = vk::SwapchainCreateInfoKHR::default()
+                .present_mode(self.presentation_mode)
+                .min_image_count(2)
+                .image_format(self.surface_format.format)
+                .image_color_space(self.surface_format.color_space)
+                .image_extent(extend)
+                .image_array_layers(1)
+                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                .clipped(true)
+                .flags(vk::SwapchainCreateFlagsKHR::empty())
+                .surface(self.surface)
+                .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT);
+
+            let swapchain = unsafe {
+                khr_device
+                    .create_swapchain(&create_info, None)
+                    .expect("Failed to create swapchain")
+            };
+
+            let swapchain_images = unsafe {
+                khr_device
+                    .get_swapchain_images(swapchain)
+                    .expect("Failed to get swap chain images")
+            };
+
+            (swapchain, swapchain_images)
+        };
+
+        let image_views: Vec<_> = swapchain_images
+            .iter()
+            .map(|image| {
+                let create_info = vk::ImageViewCreateInfo::default()
+                    .image(image.clone())
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::B8G8R8A8_SRGB)
+                    .components(
+                        vk::ComponentMapping::default()
+                            .r(vk::ComponentSwizzle::IDENTITY)
+                            .g(vk::ComponentSwizzle::IDENTITY)
+                            .b(vk::ComponentSwizzle::IDENTITY)
+                            .a(vk::ComponentSwizzle::IDENTITY),
+                    )
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    );
+
+                unsafe {
+                    device
+                        .create_image_view(&create_info, None)
+                        .expect("Failed to create image view")
+                }
+            })
+            .collect();
+
+        // Look up if cloning for vulkan objects is an expensive operation or if they
+        // are just references
+        let framebuffers: Vec<_> = image_views
+            .clone()
+            .into_iter()
+            .map(|image| {
+                let attachments = &[image];
+                let create_info = vk::FramebufferCreateInfo::default()
+                    .render_pass(render_pass)
+                    .attachments(attachments)
+                    .width(extend.width)
+                    .height(extend.height)
+                    .layers(1);
+
+                unsafe {
+                    device
+                        .create_framebuffer(&create_info, None)
+                        .expect("Failed to create frame buffer")
+                }
+            })
+            .collect();
+
+        // Cleanup of old data
+        for framebuffer in std::mem::replace(&mut self.framebuffers, framebuffers) {
+            unsafe { device.destroy_framebuffer(framebuffer, None) };
+        }
+
+        for image_view in std::mem::replace(&mut self.image_views, image_views) {
+            unsafe {
+                device.destroy_image_view(image_view, None);
+            }
+        }
+
+        self.swapchain = swapchain;
+        self.images = swapchain_images;
+    }
+
+    fn choose_swap_extend(capabilities: &vk::SurfaceCapabilitiesKHR) -> vk::Extent2D {
+        if capabilities.current_extent.width != u32::MAX {
+            capabilities.current_extent
+        } else {
+            todo!()
+        }
+    }
 }
