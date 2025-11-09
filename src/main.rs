@@ -2,6 +2,7 @@ use std::{ffi::CString, u64, usize};
 
 use ash::{Entry, vk};
 use bevy_ecs::{change_detection::Res, resource::Resource, schedule::Schedule, world::World};
+use nalgebra_glm::{Vec2, Vec3};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -13,6 +14,55 @@ use winit::{
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
+
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct Vertex {
+    pos: Vec2,
+    color: Vec3,
+}
+
+impl Vertex {
+    pub const fn get_binding_description() -> vk::VertexInputBindingDescription {
+        vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: 20,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }
+    }
+
+    pub const fn get_attribute_descriptions() -> &'static [vk::VertexInputAttributeDescription] {
+        &[
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 1,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 8,
+            },
+        ]
+    }
+}
+
+const VERTICES: &[Vertex] = &[
+    Vertex {
+        pos: Vec2::new(0.0, -0.5),
+        color: Vec3::new(1.0, 0.0, 0.0),
+    },
+    Vertex {
+        pos: Vec2::new(0.5, 0.5),
+        color: Vec3::new(0.0, 1.0, 0.0),
+    },
+    Vertex {
+        pos: Vec2::new(-0.5, 0.5),
+        color: Vec3::new(0.0, 0.0, 1.0),
+    },
+];
 
 struct App {
     window: Option<Window>,
@@ -33,6 +83,8 @@ struct App {
     schedule: Schedule,
     world: World,
     swapchain_data: Option<SwapchainData>,
+    vertex_buffer: vk::Buffer,
+    vertex_buffer_memory: vk::DeviceMemory,
 }
 
 #[derive(Resource, Default)]
@@ -132,9 +184,12 @@ impl App {
             let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
                 .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]);
 
+            let binding_descriptions = &[Vertex::get_binding_description()];
+            let attribute_descriptions = Vertex::get_attribute_descriptions();
+
             let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
-                .vertex_binding_descriptions(&[])
-                .vertex_attribute_descriptions(&[]);
+                .vertex_binding_descriptions(binding_descriptions)
+                .vertex_attribute_descriptions(attribute_descriptions);
 
             let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::default()
                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
@@ -264,6 +319,66 @@ impl App {
             (pipeline, render_pass)
         };
 
+        let vertex_buffer = {
+            let create_info = vk::BufferCreateInfo::default()
+                .size((std::mem::size_of::<Vertex>() * VERTICES.len()) as u64)
+                .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            unsafe {
+                device
+                    .create_buffer(&create_info, None)
+                    .expect("Failed to create vertex buffer")
+            }
+        };
+
+        let vertex_buffer_memory = {
+            let memory_requirements =
+                { unsafe { device.get_buffer_memory_requirements(vertex_buffer) } };
+
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(memory_requirements.size)
+                .memory_type_index(Self::find_memory_type(
+                    &instance,
+                    physical_device,
+                    memory_requirements.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                ));
+
+            unsafe {
+                device
+                    .allocate_memory(&alloc_info, None)
+                    .expect("Failed to allocated vertex buffer memory")
+            }
+        };
+
+        unsafe {
+            device
+                .bind_buffer_memory(vertex_buffer, vertex_buffer_memory, 0)
+                .expect("Failed to bind memory");
+        }
+
+        unsafe {
+            let data = device
+                .map_memory(
+                    vertex_buffer_memory,
+                    0,
+                    (std::mem::size_of::<Vertex>() * VERTICES.len()) as u64,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .expect("Failed to map");
+
+            let bytes: &[u8] = bytemuck::cast_slice(VERTICES);
+
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                data as *mut u8,
+                std::mem::size_of::<Vertex>() * VERTICES.len(),
+            );
+
+            device.unmap_memory(vertex_buffer_memory);
+        }
+
         let command_pool = {
             let create_info = vk::CommandPoolCreateInfo::default()
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
@@ -340,6 +455,8 @@ impl App {
             world,
             schedule,
             swapchain_data: None,
+            vertex_buffer,
+            vertex_buffer_memory,
         }
     }
 
@@ -388,6 +505,10 @@ impl App {
             );
         };
 
+        unsafe {
+            self.device.cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer], &[0]);
+        }
+
         let viewport = vk::Viewport::default()
             .x(0.0)
             .y(0.0)
@@ -413,7 +534,7 @@ impl App {
         }
 
         unsafe {
-            self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            self.device.cmd_draw(command_buffer, VERTICES.len() as u32, 1, 0, 0);
         }
 
         unsafe {
@@ -425,6 +546,28 @@ impl App {
                 .end_command_buffer(command_buffer)
                 .expect("Failed to record command buffer");
         }
+    }
+
+    fn find_memory_type(
+        instance: &ash::Instance,
+        device: vk::PhysicalDevice,
+        type_filter: u32,
+        properties: vk::MemoryPropertyFlags,
+    ) -> u32 {
+        let mem_properties = unsafe { instance.get_physical_device_memory_properties(device) };
+
+        *mem_properties
+            .memory_types
+            .iter()
+            .enumerate()
+            .find(|(index, mem)| {
+                (type_filter & (1 << index) != 0x00)
+                    && (mem.property_flags & properties) == properties
+            })
+            .map(|(index, _)| index)
+            .iter()
+            .next()
+            .expect("Failed to find suitable memory type") as u32
     }
 }
 

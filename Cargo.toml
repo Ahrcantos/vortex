@@ -7,4 +7,7 @@ edition = "2024"
 ash = { version = "0.38.0", features = ["linked"] }
 ash-window = "0.13.0"
 bevy_ecs = "0.16.1"
+bytemuck = { version = "1.24.0", features = ["derive"] }
+bytemuck_derive = "1.10.2"
+nalgebra-glm = { version = "0.20.0", features = ["convert-bytemuck"] }
 winit = "0.30.12"
