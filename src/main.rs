@@ -319,44 +319,15 @@ impl App {
             (pipeline, render_pass)
         };
 
-        let vertex_buffer = {
-            let create_info = vk::BufferCreateInfo::default()
-                .size((std::mem::size_of::<Vertex>() * VERTICES.len()) as u64)
-                .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-            unsafe {
-                device
-                    .create_buffer(&create_info, None)
-                    .expect("Failed to create vertex buffer")
-            }
-        };
-
-        let vertex_buffer_memory = {
-            let memory_requirements =
-                { unsafe { device.get_buffer_memory_requirements(vertex_buffer) } };
-
-            let alloc_info = vk::MemoryAllocateInfo::default()
-                .allocation_size(memory_requirements.size)
-                .memory_type_index(Self::find_memory_type(
-                    &instance,
-                    physical_device,
-                    memory_requirements.memory_type_bits,
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                ));
-
-            unsafe {
-                device
-                    .allocate_memory(&alloc_info, None)
-                    .expect("Failed to allocated vertex buffer memory")
-            }
-        };
-
-        unsafe {
-            device
-                .bind_buffer_memory(vertex_buffer, vertex_buffer_memory, 0)
-                .expect("Failed to bind memory");
-        }
+        let buffer_size = (std::mem::size_of::<Vertex>() * VERTICES.len()) as u64;
+        let (vertex_buffer, vertex_buffer_memory) = Self::create_buffer(
+            &instance,
+            physical_device,
+            &device,
+            buffer_size,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
 
         unsafe {
             let data = device
@@ -506,7 +477,8 @@ impl App {
         };
 
         unsafe {
-            self.device.cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer], &[0]);
+            self.device
+                .cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer], &[0]);
         }
 
         let viewport = vk::Viewport::default()
@@ -534,7 +506,8 @@ impl App {
         }
 
         unsafe {
-            self.device.cmd_draw(command_buffer, VERTICES.len() as u32, 1, 0, 0);
+            self.device
+                .cmd_draw(command_buffer, VERTICES.len() as u32, 1, 0, 0);
         }
 
         unsafe {
@@ -568,6 +541,51 @@ impl App {
             .iter()
             .next()
             .expect("Failed to find suitable memory type") as u32
+    }
+
+    fn create_buffer(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &ash::Device,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        properties: vk::MemoryPropertyFlags,
+    ) -> (vk::Buffer, vk::DeviceMemory) {
+        let create_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let buffer = unsafe {
+            device
+                .create_buffer(&create_info, None)
+                .expect("Failed to create buffer")
+        };
+
+        let memory_requirements = { unsafe { device.get_buffer_memory_requirements(buffer) } };
+
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(size)
+            .memory_type_index(Self::find_memory_type(
+                &instance,
+                physical_device,
+                memory_requirements.memory_type_bits,
+                properties,
+            ));
+
+        let buffer_memory = unsafe {
+            device
+                .allocate_memory(&alloc_info, None)
+                .expect("Failed to allocated buffer memory")
+        };
+
+        unsafe {
+            device
+                .bind_buffer_memory(buffer, buffer_memory, 0)
+                .expect("Failed to bind memory");
+        }
+
+        (buffer, buffer_memory)
     }
 }
 
