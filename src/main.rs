@@ -51,18 +51,24 @@ impl Vertex {
 
 const VERTICES: &[Vertex] = &[
     Vertex {
-        pos: Vec2::new(0.0, -0.5),
+        pos: Vec2::new(-0.5, -0.5),
         color: Vec3::new(1.0, 0.0, 0.0),
     },
     Vertex {
-        pos: Vec2::new(0.5, 0.5),
+        pos: Vec2::new(0.5, -0.5),
         color: Vec3::new(0.0, 1.0, 0.0),
+    },
+    Vertex {
+        pos: Vec2::new(0.5, 0.5),
+        color: Vec3::new(0.0, 0.0, 1.0),
     },
     Vertex {
         pos: Vec2::new(-0.5, 0.5),
         color: Vec3::new(0.0, 0.0, 1.0),
     },
 ];
+
+const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0];
 
 struct App {
     window: Option<Window>,
@@ -85,6 +91,8 @@ struct App {
     swapchain_data: Option<SwapchainData>,
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
+    index_buffer: vk::Buffer,
+    index_buffer_memory: vk::DeviceMemory,
 }
 
 #[derive(Resource, Default)]
@@ -339,6 +347,14 @@ impl App {
             graphics_queue,
         );
 
+        let (index_buffer, index_buffer_memory) = Self::create_index_buffer(
+            &instance,
+            physical_device,
+            &device,
+            command_pool,
+            graphics_queue,
+        );
+
         let command_buffer = {
             let alloc_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(command_pool)
@@ -405,6 +421,8 @@ impl App {
             swapchain_data: None,
             vertex_buffer,
             vertex_buffer_memory,
+            index_buffer,
+            index_buffer_memory,
         }
     }
 
@@ -458,6 +476,15 @@ impl App {
                 .cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer], &[0]);
         }
 
+        unsafe {
+            self.device.cmd_bind_index_buffer(
+                command_buffer,
+                self.index_buffer,
+                0,
+                vk::IndexType::UINT16,
+            );
+        }
+
         let viewport = vk::Viewport::default()
             .x(0.0)
             .y(0.0)
@@ -484,7 +511,7 @@ impl App {
 
         unsafe {
             self.device
-                .cmd_draw(command_buffer, VERTICES.len() as u32, 1, 0, 0);
+                .cmd_draw_indexed(command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
         }
 
         unsafe {
@@ -520,6 +547,113 @@ impl App {
             .expect("Failed to find suitable memory type") as u32
     }
 
+    fn create_index_buffer(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &ash::Device,
+        command_pool: vk::CommandPool,
+        graphics_queue: vk::Queue,
+    ) -> (vk::Buffer, vk::DeviceMemory) {
+        let buffer_size = (std::mem::size_of::<u16>() * INDICES.len()) as u64;
+        let (staging_buffer, staging_buffer_memory) = Self::create_buffer(
+            instance,
+            physical_device,
+            device,
+            buffer_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+
+        unsafe {
+            let data = device
+                .map_memory(
+                    staging_buffer_memory,
+                    0,
+                    (std::mem::size_of::<Vertex>() * VERTICES.len()) as u64,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .expect("Failed to map");
+
+            let bytes: &[u8] = bytemuck::cast_slice(INDICES);
+
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data as *mut u8, buffer_size as usize);
+
+            device.unmap_memory(staging_buffer_memory);
+        };
+
+        let (index_buffer, index_buffer_memory) = Self::create_buffer(
+            instance,
+            physical_device,
+            device,
+            buffer_size,
+            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+
+        // Copy over memory
+        let command_buffer = {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_pool(command_pool)
+                .command_buffer_count(1);
+
+            unsafe {
+                device
+                    .allocate_command_buffers(&alloc_info)
+                    .expect("Failed to allocate command buffer")
+                    .into_iter()
+                    .next()
+                    .expect("At least one command buffer should be created")
+            }
+        };
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe {
+            device
+                .begin_command_buffer(command_buffer, &begin_info)
+                .expect("Failed to begin command buffer")
+        }
+
+        unsafe {
+            let regions = &[vk::BufferCopy::default()
+                .src_offset(0)
+                .dst_offset(0)
+                .size(buffer_size)];
+
+            device.cmd_copy_buffer(command_buffer, staging_buffer, index_buffer, regions);
+        }
+
+        unsafe {
+            device
+                .end_command_buffer(command_buffer)
+                .expect("Failed to end command buffer")
+        }
+
+        let command_buffers = &[command_buffer];
+        let submit_info = vk::SubmitInfo::default().command_buffers(command_buffers);
+        unsafe {
+            device
+                .queue_submit(graphics_queue, &[submit_info], vk::Fence::null())
+                .expect("Failed to submit to queue");
+        }
+
+        unsafe {
+            device
+                .queue_wait_idle(graphics_queue)
+                .expect("Failed to wait for queue")
+        }
+
+        unsafe {
+            device.free_command_buffers(command_pool, &[command_buffer]);
+            device.destroy_buffer(staging_buffer, None);
+            device.free_memory(staging_buffer_memory, None);
+        }
+
+        (index_buffer, index_buffer_memory)
+    }
+
     fn create_vertex_buffer(
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
@@ -549,11 +683,7 @@ impl App {
 
             let bytes: &[u8] = bytemuck::cast_slice(VERTICES);
 
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                data as *mut u8,
-                std::mem::size_of::<Vertex>() * VERTICES.len(),
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data as *mut u8, buffer_size as usize);
 
             device.unmap_memory(staging_buffer_memory);
         };
