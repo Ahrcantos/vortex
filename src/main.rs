@@ -1,8 +1,12 @@
-use std::{ffi::CString, u64, usize};
+use core::f32;
+use std::{
+    ffi::{CStr, CString, c_char, c_void},
+    u64, usize,
+};
 
 use ash::{Entry, vk};
 use bevy_ecs::{change_detection::Res, resource::Resource, schedule::Schedule, world::World};
-use nalgebra_glm::{Vec2, Vec3};
+use nalgebra_glm::{Mat4, Vec2, Vec3};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -14,6 +18,33 @@ use winit::{
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
+
+unsafe extern "system" fn vulkan_debug_utils_callback(
+    message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    message_type: vk::DebugUtilsMessageTypeFlagsEXT,
+    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+    _p_user_data: *mut c_void,
+) -> vk::Bool32 {
+    let severity = match message_severity {
+        vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => "[Verbose]",
+        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => "[Warning]",
+        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => "[Error]",
+        vk::DebugUtilsMessageSeverityFlagsEXT::INFO => "[Info]",
+        _ => "[Unknown]",
+    };
+    let types = match message_type {
+        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL => "[General]",
+        vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE => "[Performance]",
+        vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION => "[Validation]",
+        _ => "[Unknown]",
+    };
+
+    let message = unsafe { CStr::from_ptr((*p_callback_data).p_message) };
+
+    println!("{} {} {:?}", severity, types, message);
+
+    vk::FALSE
+}
 
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
@@ -70,6 +101,37 @@ const VERTICES: &[Vertex] = &[
 
 const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0];
 
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct UniformBufferObject {
+    model: Mat4,
+    view: Mat4,
+    proj: Mat4,
+}
+
+impl UniformBufferObject {
+    fn from_time(time: f32, aspect: f32) -> Self {
+        // TODO: Fix perspective flipping image
+        let model = {
+            let mut m = Mat4::identity();
+            let angle = time * (f32::consts::TAU / 4.0);
+            let axis = Vec3::new(0.0, 0.0, 1.0);
+            nalgebra_glm::rotate(&mut m, angle, &axis)
+        };
+
+        let view = {
+            let eye = Vec3::new(2.0, 2.0, 2.0);
+            let center = Vec3::new(0.0, 0.0, 0.0);
+            let up = Vec3::new(0.0, 0.0, 1.0);
+            nalgebra_glm::look_at(&eye, &center, &up)
+        };
+
+        let proj = nalgebra_glm::perspective(aspect, f32::consts::TAU / 8.0, 0.1, 10.0);
+
+        Self { model, view, proj }
+    }
+}
+
 struct App {
     window: Option<Window>,
     entry: ash::Entry,
@@ -78,6 +140,7 @@ struct App {
     device: ash::Device,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
+    descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline: vk::Pipeline,
     render_pass: vk::RenderPass,
     _command_pool: vk::CommandPool,
@@ -93,6 +156,14 @@ struct App {
     vertex_buffer_memory: vk::DeviceMemory,
     index_buffer: vk::Buffer,
     index_buffer_memory: vk::DeviceMemory,
+    // Only one uniform buffer because only one frame is in flight
+    uniform_buffer: vk::Buffer,
+    uniform_buffer_memory: vk::DeviceMemory,
+    uniform_buffer_mapped: *mut c_void,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+    pipeline_layout: vk::PipelineLayout,
+    delta: f32,
 }
 
 #[derive(Resource, Default)]
@@ -114,18 +185,24 @@ impl App {
 
             let layer_names = &[{ c"VK_LAYER_KHRONOS_validation".as_ptr() }];
 
-            let extension_names = ash_window::enumerate_required_extensions(
-                event_loop
-                    .display_handle()
-                    .expect("Could not retrieve display handle")
-                    .as_raw(),
-            )
-            .expect("Failed to enumerate required extensions");
+            let mut extension_names: Vec<*const c_char> =
+                ash_window::enumerate_required_extensions(
+                    event_loop
+                        .display_handle()
+                        .expect("Could not retrieve display handle")
+                        .as_raw(),
+                )
+                .expect("Failed to enumerate required extensions")
+                .into_iter()
+                .map(|extension| *extension)
+                .collect();
+
+            extension_names.push(c"VK_EXT_debug_utils".as_ptr());
 
             let create_info = vk::InstanceCreateInfo::default()
                 .flags(vk::InstanceCreateFlags::empty())
                 .enabled_layer_names(layer_names)
-                .enabled_extension_names(extension_names)
+                .enabled_extension_names(&extension_names[..])
                 .application_info(&app_info);
 
             unsafe {
@@ -134,6 +211,29 @@ impl App {
                     .expect("Failed to create instance")
             }
         };
+
+        let dbg_instance = ash::ext::debug_utils::Instance::new(&entry, &instance);
+
+        {
+            let create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+                .message_severity(
+                    vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+                )
+                .message_type(
+                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                        | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+                )
+                .pfn_user_callback(Some(vulkan_debug_utils_callback));
+
+            unsafe {
+                dbg_instance
+                    .create_debug_utils_messenger(&create_info, None)
+                    .expect("Failed to create debug messenger");
+            }
+        }
 
         let physical_devices = unsafe {
             instance
@@ -172,7 +272,58 @@ impl App {
         let graphics_queue = unsafe { device.get_device_queue(0, 0) };
         let present_queue = unsafe { device.get_device_queue(0, 0) };
 
-        let (graphics_pipeline, render_pass) = {
+        let descriptor_set_layout = {
+            let ubo_layout_binding = vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX);
+
+            let bindings = &[ubo_layout_binding];
+
+            let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(bindings);
+
+            unsafe {
+                device
+                    .create_descriptor_set_layout(&create_info, None)
+                    .expect("Failed to create descriptor set layout")
+            }
+        };
+
+        let descriptor_pool = {
+            let pool_size = vk::DescriptorPoolSize::default()
+                .descriptor_count(1)
+                .ty(vk::DescriptorType::UNIFORM_BUFFER);
+            let pool_sizes = &[pool_size];
+            let pool_info = vk::DescriptorPoolCreateInfo::default()
+                .pool_sizes(pool_sizes)
+                .max_sets(1);
+
+            unsafe {
+                device
+                    .create_descriptor_pool(&pool_info, None)
+                    .expect("Failed to create descriptor pool")
+            }
+        };
+
+        let descriptor_set = {
+            let set_layouts = &[descriptor_set_layout];
+
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(set_layouts);
+
+            unsafe {
+                device
+                    .allocate_descriptor_sets(&alloc_info)
+                    .expect("Failed to allocate descriptor sets")
+                    .into_iter()
+                    .next()
+                    .expect("No descriptor sets allocated")
+            }
+        };
+
+        let (graphics_pipeline, render_pass, pipeline_layout) = {
             let vertex_shader =
                 create_shader_module(&device, include_bytes!("../shaders/vert.spv"));
 
@@ -235,8 +386,10 @@ impl App {
                 .logic_op_enable(false)
                 .attachments(color_blend_attachments);
 
+            let set_layouts = &[descriptor_set_layout];
+
             let pipeline_layout = {
-                let create_info = vk::PipelineLayoutCreateInfo::default();
+                let create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(set_layouts);
 
                 unsafe {
                     device
@@ -324,7 +477,7 @@ impl App {
                 device.destroy_shader_module(fragment_shader, None);
             }
 
-            (pipeline, render_pass)
+            (pipeline, render_pass, pipeline_layout)
         };
 
         let command_pool = {
@@ -354,6 +507,34 @@ impl App {
             command_pool,
             graphics_queue,
         );
+
+        let (uniform_buffer, uniform_buffer_memory, uniform_buffer_mapped) =
+            Self::create_uniform_buffer(&instance, physical_device, &device);
+
+        // Configure descriptor set
+        {
+            let range = std::mem::size_of::<UniformBufferObject>() as u64;
+            let buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(uniform_buffer)
+                .offset(0)
+                .range(range);
+
+            let buffer_info = &[buffer_info];
+
+            let descriptor_write = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .buffer_info(buffer_info);
+
+            let descriptor_writes = &[descriptor_write];
+
+            unsafe {
+                device.update_descriptor_sets(descriptor_writes, &[]);
+            }
+        }
 
         let command_buffer = {
             let alloc_info = vk::CommandBufferAllocateInfo::default()
@@ -405,6 +586,7 @@ impl App {
             device,
             graphics_queue,
             present_queue,
+            descriptor_set_layout,
             pipeline: graphics_pipeline,
             render_pass,
             _command_pool: command_pool.clone(),
@@ -423,6 +605,16 @@ impl App {
             vertex_buffer_memory,
             index_buffer,
             index_buffer_memory,
+
+            uniform_buffer,
+            uniform_buffer_memory,
+            uniform_buffer_mapped,
+
+            descriptor_pool,
+            descriptor_set,
+
+            pipeline_layout,
+            delta: 0.0,
         }
     }
 
@@ -510,6 +702,18 @@ impl App {
         }
 
         unsafe {
+            let descriptor_sets = &[self.descriptor_set];
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                descriptor_sets,
+                &[],
+            );
+        }
+
+        unsafe {
             self.device
                 .cmd_draw_indexed(command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
         }
@@ -545,6 +749,31 @@ impl App {
             .iter()
             .next()
             .expect("Failed to find suitable memory type") as u32
+    }
+
+    fn create_uniform_buffer(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &ash::Device,
+    ) -> (vk::Buffer, vk::DeviceMemory, *mut c_void) {
+        let buffer_size = std::mem::size_of::<UniformBufferObject>() as u64;
+
+        let (buffer, buffer_memory) = Self::create_buffer(
+            instance,
+            physical_device,
+            device,
+            buffer_size,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+
+        let mapped = unsafe {
+            device
+                .map_memory(buffer_memory, 0, buffer_size, vk::MemoryMapFlags::empty())
+                .expect("Failed to map memory")
+        };
+
+        (buffer, buffer_memory, mapped)
     }
 
     fn create_index_buffer(
@@ -837,7 +1066,6 @@ impl ApplicationHandler for App {
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        dbg!("Suspended");
         // self.cleanup_swapchain();
     }
 
@@ -952,6 +1180,26 @@ impl ApplicationHandler for App {
                     }
                 };
 
+                let aspect = self.swapchain_data.as_ref().unwrap().aspect();
+                let ubo = UniformBufferObject::from_time(self.delta, aspect);
+
+                if self.delta <= 6.2 {
+                    self.delta += 0.001;
+                } else {
+                    self.delta = 0.0;
+                }
+
+                unsafe {
+                    let data = &[ubo];
+                    let data: &[u8] = bytemuck::cast_slice(data);
+                    let size = std::mem::size_of::<UniformBufferObject>();
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        self.uniform_buffer_mapped as *mut u8,
+                        size,
+                    );
+                }
+
                 // Submit final image back to swap chain (present)
                 {
                     let signal_semaphores = &[self.render_finished_semaphore];
@@ -969,7 +1217,7 @@ impl ApplicationHandler for App {
 
                     let device = ash::khr::swapchain::Device::new(&self.instance, &self.device);
 
-                    unsafe {
+                    let suboptimal = unsafe {
                         device
                             .queue_present(self.present_queue, &present_info)
                             .expect("Failed to present")
@@ -1019,9 +1267,14 @@ struct SwapchainData {
     pub framebuffers: Vec<vk::Framebuffer>,
     pub surface_format: vk::SurfaceFormatKHR,
     pub presentation_mode: vk::PresentModeKHR,
+    pub extent: vk::Extent2D,
 }
 
 impl SwapchainData {
+    pub fn aspect(&self) -> f32 {
+        self.extent.width as f32 / self.extent.height as f32
+    }
+
     pub fn setup(
         entry: &ash::Entry,
         instance: &ash::Instance,
@@ -1076,7 +1329,7 @@ impl SwapchainData {
             .and_then(|format| Some(format.clone()))
             .unwrap_or(surface_formats[0].clone());
 
-        let extend = Self::choose_swap_extend(&surface_capabilities);
+        let extent = Self::choose_swap_extent(&surface_capabilities);
 
         let khr_device = ash::khr::swapchain::Device::new(instance, device);
 
@@ -1086,7 +1339,7 @@ impl SwapchainData {
                 .min_image_count(2)
                 .image_format(surface_format.format)
                 .image_color_space(surface_format.color_space)
-                .image_extent(extend)
+                .image_extent(extent)
                 .image_array_layers(1)
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -1152,8 +1405,8 @@ impl SwapchainData {
                 let create_info = vk::FramebufferCreateInfo::default()
                     .render_pass(render_pass)
                     .attachments(attachments)
-                    .width(extend.width)
-                    .height(extend.height)
+                    .width(extent.width)
+                    .height(extent.height)
                     .layers(1);
 
                 unsafe {
@@ -1172,6 +1425,7 @@ impl SwapchainData {
             framebuffers,
             presentation_mode,
             surface_format,
+            extent,
         }
     }
 
@@ -1210,7 +1464,7 @@ impl SwapchainData {
                 .expect("Failed to get device surface capabilities")
         };
 
-        let extend = Self::choose_swap_extend(&surface_capabilities);
+        let extent = Self::choose_swap_extent(&surface_capabilities);
 
         let (swapchain, swapchain_images) = {
             let create_info = vk::SwapchainCreateInfoKHR::default()
@@ -1218,7 +1472,7 @@ impl SwapchainData {
                 .min_image_count(2)
                 .image_format(self.surface_format.format)
                 .image_color_space(self.surface_format.color_space)
-                .image_extent(extend)
+                .image_extent(extent)
                 .image_array_layers(1)
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -1284,8 +1538,8 @@ impl SwapchainData {
                 let create_info = vk::FramebufferCreateInfo::default()
                     .render_pass(render_pass)
                     .attachments(attachments)
-                    .width(extend.width)
-                    .height(extend.height)
+                    .width(extent.width)
+                    .height(extent.height)
                     .layers(1);
 
                 unsafe {
@@ -1309,9 +1563,10 @@ impl SwapchainData {
 
         self.swapchain = swapchain;
         self.images = swapchain_images;
+        self.extent = extent;
     }
 
-    fn choose_swap_extend(capabilities: &vk::SurfaceCapabilitiesKHR) -> vk::Extent2D {
+    fn choose_swap_extent(capabilities: &vk::SurfaceCapabilitiesKHR) -> vk::Extent2D {
         if capabilities.current_extent.width != u32::MAX {
             capabilities.current_extent
         } else {
