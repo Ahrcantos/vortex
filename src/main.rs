@@ -1,10 +1,12 @@
+mod render_context;
+
 use core::f32;
 use std::{
-    ffi::{CStr, CString, c_char, c_void},
+    ffi::{CStr, c_void},
     u64, usize,
 };
 
-use ash::{Entry, vk};
+use ash::vk;
 use bevy_ecs::{change_detection::Res, resource::Resource, schedule::Schedule, world::World};
 use nalgebra_glm::{Mat4, Vec2, Vec3};
 use winit::{
@@ -15,6 +17,8 @@ use winit::{
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
     window::{Window, WindowId},
 };
+
+use crate::render_context::RenderContext;
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -134,10 +138,7 @@ impl UniformBufferObject {
 
 struct App {
     window: Option<Window>,
-    entry: ash::Entry,
-    instance: ash::Instance,
-    physical_device: vk::PhysicalDevice,
-    device: ash::Device,
+    render_context: RenderContext,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
     descriptor_set_layout: vk::DescriptorSetLayout,
@@ -171,46 +172,12 @@ struct FrameCounter(usize);
 
 impl App {
     pub fn new<T>(event_loop: &EventLoop<T>) -> Self {
-        let entry = Entry::linked();
-        let instance = {
-            let app_name = CString::new("vortex").unwrap();
-            let engine_name = CString::new("Vulkan Engine").unwrap();
+        let render_context = RenderContext::new(event_loop);
 
-            let app_info = vk::ApplicationInfo::default()
-                .application_name(&app_name)
-                .application_version(vk::make_api_version(0, 0, 0, 1))
-                .engine_name(&engine_name)
-                .engine_version(vk::make_api_version(0, 0, 0, 1))
-                .api_version(vk::API_VERSION_1_0);
-
-            let layer_names = &[{ c"VK_LAYER_KHRONOS_validation".as_ptr() }];
-
-            let mut extension_names: Vec<*const c_char> =
-                ash_window::enumerate_required_extensions(
-                    event_loop
-                        .display_handle()
-                        .expect("Could not retrieve display handle")
-                        .as_raw(),
-                )
-                .expect("Failed to enumerate required extensions")
-                .into_iter()
-                .map(|extension| *extension)
-                .collect();
-
-            extension_names.push(c"VK_EXT_debug_utils".as_ptr());
-
-            let create_info = vk::InstanceCreateInfo::default()
-                .flags(vk::InstanceCreateFlags::empty())
-                .enabled_layer_names(layer_names)
-                .enabled_extension_names(&extension_names[..])
-                .application_info(&app_info);
-
-            unsafe {
-                entry
-                    .create_instance(&create_info, None)
-                    .expect("Failed to create instance")
-            }
-        };
+        let device = render_context.device();
+        let instance = render_context.instance();
+        let entry = render_context.entry();
+        let physical_device = render_context.physical_device();
 
         let dbg_instance = ash::ext::debug_utils::Instance::new(&entry, &instance);
 
@@ -234,40 +201,6 @@ impl App {
                     .expect("Failed to create debug messenger");
             }
         }
-
-        let physical_devices = unsafe {
-            instance
-                .enumerate_physical_devices()
-                .expect("Failed to enumerate physical devices")
-        };
-
-        let physical_device = physical_devices
-            .into_iter()
-            .find(|device| is_device_suitable(&instance, device.clone()))
-            .expect("No suiteable device found");
-
-        let device = {
-            let queue_create_info = vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(0) // TODO: look up index
-                .queue_priorities(&[1.0]);
-
-            let device_features = vk::PhysicalDeviceFeatures::default();
-
-            let queue_create_infos = &[queue_create_info];
-
-            let extension_names = &[c"VK_KHR_swapchain".as_ptr()];
-
-            let device_create_info = vk::DeviceCreateInfo::default()
-                .queue_create_infos(queue_create_infos)
-                .enabled_features(&device_features)
-                .enabled_extension_names(extension_names);
-
-            unsafe {
-                instance
-                    .create_device(physical_device, &device_create_info, None)
-                    .expect("Failed to create logical device")
-            }
-        };
 
         let graphics_queue = unsafe { device.get_device_queue(0, 0) };
         let present_queue = unsafe { device.get_device_queue(0, 0) };
@@ -580,10 +513,7 @@ impl App {
 
         Self {
             window: None,
-            entry,
-            instance,
-            physical_device,
-            device,
+            render_context,
             graphics_queue,
             present_queue,
             descriptor_set_layout,
@@ -621,8 +551,10 @@ impl App {
     fn record_command_buffer(&self, command_buffer: vk::CommandBuffer, image_index: u32) {
         let begin_info = vk::CommandBufferBeginInfo::default();
 
+        let device = self.render_context.device();
+
         unsafe {
-            self.device
+            device
                 .begin_command_buffer(command_buffer, &begin_info)
                 .expect("Failed to begin command buffer")
         }
@@ -648,7 +580,7 @@ impl App {
             }]);
 
         unsafe {
-            self.device.cmd_begin_render_pass(
+            device.cmd_begin_render_pass(
                 command_buffer,
                 &render_pass_begin_info,
                 vk::SubpassContents::INLINE,
@@ -656,7 +588,7 @@ impl App {
         };
 
         unsafe {
-            self.device.cmd_bind_pipeline(
+            device.cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline,
@@ -664,12 +596,11 @@ impl App {
         };
 
         unsafe {
-            self.device
-                .cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer], &[0]);
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer], &[0]);
         }
 
         unsafe {
-            self.device.cmd_bind_index_buffer(
+            device.cmd_bind_index_buffer(
                 command_buffer,
                 self.index_buffer,
                 0,
@@ -686,7 +617,7 @@ impl App {
             .max_depth(1.0);
 
         unsafe {
-            self.device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+            device.cmd_set_viewport(command_buffer, 0, &[viewport]);
         };
 
         let scissor = vk::Rect2D {
@@ -698,12 +629,12 @@ impl App {
         };
 
         unsafe {
-            self.device.cmd_set_scissor(command_buffer, 0, &[scissor]);
+            device.cmd_set_scissor(command_buffer, 0, &[scissor]);
         }
 
         unsafe {
             let descriptor_sets = &[self.descriptor_set];
-            self.device.cmd_bind_descriptor_sets(
+            device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout,
@@ -714,16 +645,15 @@ impl App {
         }
 
         unsafe {
-            self.device
-                .cmd_draw_indexed(command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
+            device.cmd_draw_indexed(command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
         }
 
         unsafe {
-            self.device.cmd_end_render_pass(command_buffer);
+            device.cmd_end_render_pass(command_buffer);
         }
 
         unsafe {
-            self.device
+            device
                 .end_command_buffer(command_buffer)
                 .expect("Failed to record command buffer");
         }
@@ -1052,14 +982,8 @@ impl ApplicationHandler for App {
             )
             .unwrap();
 
-        let swapchain_data = SwapchainData::setup(
-            &self.entry,
-            &self.instance,
-            self.physical_device.clone(),
-            &self.device,
-            self.render_pass.clone(),
-            &window,
-        );
+        let swapchain_data =
+            SwapchainData::setup(&self.render_context, self.render_pass.clone(), &window);
 
         self.window = Some(window);
         self.swapchain_data = Some(swapchain_data);
@@ -1075,27 +999,27 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        let device = self.render_context.device();
+        let instance = self.render_context.instance();
+
         match event {
             WindowEvent::CloseRequested => {
                 // Wait for rendering to finish and only then clean up
-                unsafe { self.device.device_wait_idle().expect("Failed to wait") };
+                unsafe { device.device_wait_idle().expect("Failed to wait") };
 
                 event_loop.exit();
             }
 
             WindowEvent::Resized(size) => {
                 unsafe {
-                    self.device.device_wait_idle().expect("Failed to wait");
+                    device.device_wait_idle().expect("Failed to wait");
                 }
 
                 self.window_size = size;
 
                 if let Some(swapchain) = &mut self.swapchain_data {
                     swapchain.recreate(
-                        &self.entry,
-                        &self.instance,
-                        self.physical_device,
-                        &self.device,
+                        &self.render_context,
                         self.render_pass,
                         self.window.as_ref().expect("Window not present"),
                     );
@@ -1105,13 +1029,13 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 // Wait for the last frame to be fully drawn
                 unsafe {
-                    self.device
+                    device
                         .wait_for_fences(&[self.in_flight_fence], true, u64::MAX)
                         .expect("Failed to wait for fence");
                 };
 
                 unsafe {
-                    self.device
+                    device
                         .reset_fences(&[self.in_flight_fence])
                         .expect("Failed to reset fence");
                 };
@@ -1121,7 +1045,7 @@ impl ApplicationHandler for App {
                 // for which we need to pick the associated frame buffer
 
                 let image_index = {
-                    let device = ash::khr::swapchain::Device::new(&self.instance, &self.device);
+                    let device = ash::khr::swapchain::Device::new(instance, device);
                     let (image_index, _) = unsafe {
                         device
                             .acquire_next_image(
@@ -1150,7 +1074,7 @@ impl ApplicationHandler for App {
 
                 // Recording the command buffer
                 unsafe {
-                    self.device
+                    device
                         .reset_command_buffer(
                             self.command_buffer,
                             vk::CommandBufferResetFlags::empty(),
@@ -1174,7 +1098,7 @@ impl ApplicationHandler for App {
                         .signal_semaphores(signal_semaphores);
 
                     unsafe {
-                        self.device
+                        device
                             .queue_submit(self.graphics_queue, &[submit_info], self.in_flight_fence)
                             .expect("Failed to submit to queue")
                     }
@@ -1215,7 +1139,7 @@ impl ApplicationHandler for App {
                         .swapchains(swapchains)
                         .image_indices(image_indicies);
 
-                    let device = ash::khr::swapchain::Device::new(&self.instance, &self.device);
+                    let device = ash::khr::swapchain::Device::new(instance, device);
 
                     let suboptimal = unsafe {
                         device
@@ -1276,13 +1200,15 @@ impl SwapchainData {
     }
 
     pub fn setup(
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        device: &ash::Device,
+        render_context: &RenderContext,
         render_pass: vk::RenderPass,
         window: &Window,
     ) -> Self {
+        let entry = render_context.entry();
+        let instance = render_context.instance();
+        let physical_device = render_context.physical_device();
+        let device = render_context.device();
+
         let surface = unsafe {
             ash_window::create_surface(
                 entry,
@@ -1431,13 +1357,15 @@ impl SwapchainData {
 
     pub fn recreate(
         &mut self,
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        device: &ash::Device,
+        render_context: &RenderContext,
         render_pass: vk::RenderPass,
         window: &Window,
     ) {
+        let entry = render_context.entry();
+        let instance = render_context.instance();
+        let physical_device = render_context.physical_device();
+        let device = render_context.device();
+
         let khr_instance = ash::khr::surface::Instance::new(entry, instance);
         let khr_device = ash::khr::swapchain::Device::new(instance, device);
 
