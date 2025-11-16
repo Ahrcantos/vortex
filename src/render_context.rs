@@ -1,9 +1,9 @@
-use std::ffi::{CString, c_char};
+use std::ffi::{CString, c_char, c_void};
 
 use ash::{Device, Entry, Instance, vk};
 use winit::{event_loop::EventLoop, raw_window_handle::HasDisplayHandle};
 
-use crate::vertex::Vertex;
+use crate::{UniformBufferObject, vertex::Vertex};
 
 pub struct RenderContext {
     entry: Entry,
@@ -136,12 +136,12 @@ impl RenderContext {
 
         let descriptor_pool = {
             let pool_size = vk::DescriptorPoolSize::default()
-                .descriptor_count(1)
+                .descriptor_count(2)
                 .ty(vk::DescriptorType::UNIFORM_BUFFER);
             let pool_sizes = &[pool_size];
             let pool_info = vk::DescriptorPoolCreateInfo::default()
                 .pool_sizes(pool_sizes)
-                .max_sets(1);
+                .max_sets(2);
 
             unsafe {
                 device
@@ -422,6 +422,25 @@ impl RenderContext {
         }
 
         (vertex_buffer, vertex_buffer_memory)
+    }
+
+    pub fn create_uniform_buffer(&self) -> (vk::Buffer, vk::DeviceMemory, *mut c_void) {
+        let device = self.device();
+        let buffer_size = std::mem::size_of::<UniformBufferObject>() as u64;
+
+        let (buffer, buffer_memory) = self.create_buffer(
+            buffer_size,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+
+        let mapped = unsafe {
+            device
+                .map_memory(buffer_memory, 0, buffer_size, vk::MemoryMapFlags::empty())
+                .expect("Failed to map memory")
+        };
+
+        (buffer, buffer_memory, mapped)
     }
 
     pub fn create_index_buffer(&self, indices: &[u16]) -> (vk::Buffer, vk::DeviceMemory) {
