@@ -56,25 +56,114 @@ unsafe extern "system" fn vulkan_debug_utils_callback(
 }
 
 const VERTICES: &[Vertex] = &[
+    // Bottom
     Vertex {
-        pos: Vec2::new(-0.5, -0.5),
+        pos: Vec3::new(0.0, 0.0, 0.0),
         color: Vec3::new(1.0, 0.0, 0.0),
     },
     Vertex {
-        pos: Vec2::new(0.5, -0.5),
+        pos: Vec3::new(1.0, 0.0, 0.0),
         color: Vec3::new(0.0, 1.0, 0.0),
     },
     Vertex {
-        pos: Vec2::new(0.5, 0.5),
+        pos: Vec3::new(0.0, 1.0, 0.0),
         color: Vec3::new(0.0, 0.0, 1.0),
     },
     Vertex {
-        pos: Vec2::new(-0.5, 0.5),
+        pos: Vec3::new(1.0, 1.0, 0.0),
+        color: Vec3::new(0.0, 0.0, 1.0),
+    },
+    // Top
+    Vertex {
+        pos: Vec3::new(0.0, 0.0, 1.0),
+        color: Vec3::new(1.0, 0.0, 0.0),
+    },
+    Vertex {
+        pos: Vec3::new(1.0, 0.0, 1.0),
+        color: Vec3::new(0.0, 1.0, 0.0),
+    },
+    Vertex {
+        pos: Vec3::new(0.0, 1.0, 1.0),
+        color: Vec3::new(0.0, 0.0, 1.0),
+    },
+    Vertex {
+        pos: Vec3::new(1.0, 1.0, 1.0),
+        color: Vec3::new(0.0, 0.0, 1.0),
+    },
+    // Left
+    Vertex {
+        pos: Vec3::new(0.0, 0.0, 0.0),
+        color: Vec3::new(1.0, 0.0, 0.0),
+    },
+    Vertex {
+        pos: Vec3::new(0.0, 0.0, 1.0),
+        color: Vec3::new(0.0, 1.0, 0.0),
+    },
+    Vertex {
+        pos: Vec3::new(1.0, 0.0, 0.0),
+        color: Vec3::new(0.0, 0.0, 1.0),
+    },
+    Vertex {
+        pos: Vec3::new(1.0, 0.0, 1.0),
+        color: Vec3::new(0.0, 0.0, 1.0),
+    },
+    // Right
+    Vertex {
+        pos: Vec3::new(0.0, 1.0, 0.0),
+        color: Vec3::new(1.0, 0.0, 0.0),
+    },
+    Vertex {
+        pos: Vec3::new(0.0, 1.0, 1.0),
+        color: Vec3::new(0.0, 1.0, 0.0),
+    },
+    Vertex {
+        pos: Vec3::new(1.0, 1.0, 0.0),
+        color: Vec3::new(0.0, 0.0, 1.0),
+    },
+    Vertex {
+        pos: Vec3::new(1.0, 1.0, 1.0),
+        color: Vec3::new(0.0, 0.0, 1.0),
+    },
+    // Back
+    Vertex {
+        pos: Vec3::new(0.0, 0.0, 0.0),
+        color: Vec3::new(1.0, 0.0, 0.0),
+    },
+    Vertex {
+        pos: Vec3::new(0.0, 0.0, 1.0),
+        color: Vec3::new(0.0, 1.0, 0.0),
+    },
+    Vertex {
+        pos: Vec3::new(0.0, 1.0, 0.0),
+        color: Vec3::new(0.0, 0.0, 1.0),
+    },
+    Vertex {
+        pos: Vec3::new(0.0, 1.0, 1.0),
+        color: Vec3::new(0.0, 0.0, 1.0),
+    },
+    // Front
+    Vertex {
+        pos: Vec3::new(1.0, 0.0, 0.0),
+        color: Vec3::new(1.0, 0.0, 0.0),
+    },
+    Vertex {
+        pos: Vec3::new(1.0, 0.0, 1.0),
+        color: Vec3::new(0.0, 1.0, 0.0),
+    },
+    Vertex {
+        pos: Vec3::new(1.0, 1.0, 0.0),
+        color: Vec3::new(0.0, 0.0, 1.0),
+    },
+    Vertex {
+        pos: Vec3::new(1.0, 1.0, 1.0),
         color: Vec3::new(0.0, 0.0, 1.0),
     },
 ];
 
-const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0];
+const INDICES: &[u16] = &[
+    0, 2, 1, 1, 2, 3, 4, 5, 6, 5, 7, 6, 8, 10, 9, 9, 10, 11, 12, 13, 14, 13, 15, 14, 16, 17, 18,
+    17, 19, 18, 20, 22, 21, 21, 22, 23,
+];
 
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
@@ -98,10 +187,10 @@ impl UniformBufferObject {
             let eye = Vec3::new(2.0, 2.0, 2.0);
             let center = Vec3::new(0.0, 0.0, 0.0);
             let up = Vec3::new(0.0, 0.0, 1.0);
-            nalgebra_glm::look_at(&eye, &center, &up)
+            nalgebra_glm::look_at_rh(&eye, &center, &up)
         };
 
-        let proj = nalgebra_glm::perspective(aspect, f32::consts::TAU / 8.0, 0.1, 10.0);
+        let proj = nalgebra_glm::perspective_rh_zo(aspect, f32::consts::TAU / 8.0, 0.1, 10.0);
 
         Self { model, view, proj }
     }
@@ -274,7 +363,7 @@ impl ApplicationHandler for App {
                 let aspect = self.swapchain_data.as_ref().unwrap().aspect();
                 let ubo = UniformBufferObject::from_time(self.delta, aspect);
 
-                self.delta += 0.001;
+                self.delta += 0.00001;
 
                 unsafe {
                     let data = &[ubo];
