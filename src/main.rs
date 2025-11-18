@@ -11,7 +11,7 @@ use std::{
 
 use ash::vk;
 use bevy_ecs::{change_detection::Res, resource::Resource, schedule::Schedule, world::World};
-use nalgebra_glm::{Mat4, Vec2, Vec3};
+use nalgebra_glm::{Mat4, Vec3};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -207,6 +207,10 @@ struct App {
     vertex_buffer_memory: vk::DeviceMemory,
     index_buffer: vk::Buffer,
     index_buffer_memory: vk::DeviceMemory,
+    texture_image: vk::Image,
+    texture_image_view: vk::ImageView,
+    texture_image_memory: vk::DeviceMemory,
+    texture_sampler: vk::Sampler,
     delta: f32,
     frame_state: FrameState,
 }
@@ -247,8 +251,12 @@ impl App {
 
         let (vertex_buffer, vertex_buffer_memory) = render_context.create_vertex_buffer(VERTICES);
         let (index_buffer, index_buffer_memory) = render_context.create_index_buffer(INDICES);
+        let (texture_image, texture_image_memory) = render_context.create_voxel_texture();
+        let texture_image_view = render_context.create_voxel_texture_image_view(texture_image);
+        let texture_sampler = render_context.create_texture_sampler();
 
-        let frame_state = FrameState::new(render_context.clone());
+        let frame_state =
+            FrameState::new(render_context.clone(), texture_image_view, texture_sampler);
 
         let mut world = World::new();
         world.insert_resource(FrameCounter::default());
@@ -271,6 +279,10 @@ impl App {
             vertex_buffer_memory,
             index_buffer,
             index_buffer_memory,
+            texture_image,
+            texture_image_view,
+            texture_image_memory,
+            texture_sampler,
 
             delta: 0.0,
         }

@@ -11,9 +11,13 @@ pub struct FrameState {
 }
 
 impl FrameState {
-    pub fn new(render_context: Arc<RenderContext>) -> Self {
-        let left_frame = Frame::new(render_context.clone());
-        let right_frame = Frame::new(render_context);
+    pub fn new(
+        render_context: Arc<RenderContext>,
+        image_view: vk::ImageView,
+        sampler: vk::Sampler,
+    ) -> Self {
+        let left_frame = Frame::new(render_context.clone(), image_view, sampler);
+        let right_frame = Frame::new(render_context, image_view, sampler);
 
         Self {
             left_frame,
@@ -60,7 +64,11 @@ pub struct AquiredImage {
 }
 
 impl Frame {
-    pub fn new(render_context: Arc<RenderContext>) -> Self {
+    pub fn new(
+        render_context: Arc<RenderContext>,
+        image_view: vk::ImageView,
+        sampler: vk::Sampler,
+    ) -> Self {
         let device = render_context.device();
         let command_pool = render_context.command_pool();
         let descriptor_pool = render_context.descriptor_pool();
@@ -96,7 +104,7 @@ impl Frame {
 
             let buffer_info = &[buffer_info];
 
-            let descriptor_write = vk::WriteDescriptorSet::default()
+            let buffer_descriptor_write = vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
                 .dst_binding(0)
                 .dst_array_element(0)
@@ -104,7 +112,22 @@ impl Frame {
                 .descriptor_count(1)
                 .buffer_info(buffer_info);
 
-            let descriptor_writes = &[descriptor_write];
+            let image_info = vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(image_view)
+                .sampler(sampler);
+
+            let image_info = &[image_info];
+
+            let image_descriptor_write = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(1)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .image_info(image_info);
+
+            let descriptor_writes = &[buffer_descriptor_write, image_descriptor_write];
 
             unsafe {
                 device.update_descriptor_sets(descriptor_writes, &[]);

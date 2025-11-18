@@ -73,6 +73,8 @@ impl RenderContext {
                 .expect("Failed to enumerate physical devices")
         };
 
+        dbg!(&physical_devices);
+
         let physical_device = physical_devices
             .into_iter()
             .find(|device| is_device_suitable(&instance, device.clone()))
@@ -123,7 +125,13 @@ impl RenderContext {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::VERTEX);
 
-            let bindings = &[ubo_layout_binding];
+            let sampler_layout_binding = vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+            let bindings = &[ubo_layout_binding, sampler_layout_binding];
 
             let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(bindings);
 
@@ -135,10 +143,15 @@ impl RenderContext {
         };
 
         let descriptor_pool = {
-            let pool_size = vk::DescriptorPoolSize::default()
+            let ubo_pool_size = vk::DescriptorPoolSize::default()
                 .descriptor_count(2)
                 .ty(vk::DescriptorType::UNIFORM_BUFFER);
-            let pool_sizes = &[pool_size];
+
+            let sampler_pool_size = vk::DescriptorPoolSize::default()
+                .descriptor_count(2)
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER);
+
+            let pool_sizes = &[ubo_pool_size, sampler_pool_size];
             let pool_info = vk::DescriptorPoolCreateInfo::default()
                 .pool_sizes(pool_sizes)
                 .max_sets(2);
@@ -324,6 +337,148 @@ impl RenderContext {
             descriptor_set_layout,
             descriptor_pool,
         }
+    }
+
+    pub fn create_texture_sampler(&self) -> vk::Sampler {
+        let device = self.device();
+
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::MIRRORED_REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::MIRRORED_REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::MIRRORED_REPEAT)
+            .anisotropy_enable(false)
+            .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
+            .unnormalized_coordinates(false)
+            .compare_enable(false)
+            .compare_op(vk::CompareOp::ALWAYS)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .mip_lod_bias(0.0)
+            .min_lod(0.0)
+            .max_lod(0.0);
+
+        unsafe {
+            device
+                .create_sampler(&sampler_info, None)
+                .expect("Failed to create sampler")
+        }
+    }
+
+    pub fn create_voxel_texture_image_view(&self, image: vk::Image) -> vk::ImageView {
+        let device = self.device();
+
+        let subresource_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_3D)
+            .format(vk::Format::R8_SRGB)
+            .subresource_range(subresource_range);
+
+        unsafe {
+            device
+                .create_image_view(&view_info, None)
+                .expect("Failed to create image view")
+        }
+    }
+
+    pub fn create_voxel_texture(&self) -> (vk::Image, vk::DeviceMemory) {
+        let device = self.device();
+
+        const DATA_SIZE: usize = 4 * 4 * 4;
+        let mut voxel_data: [u8; DATA_SIZE] = [0x00; DATA_SIZE];
+        voxel_data[0] = 0xFF;
+
+        let (staging_buffer, staging_buffer_memory) = self.create_buffer(
+            DATA_SIZE as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+
+        unsafe {
+            let data = device
+                .map_memory(
+                    staging_buffer_memory,
+                    0,
+                    DATA_SIZE as u64,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .expect("Failed to map memory");
+
+            std::ptr::copy_nonoverlapping(voxel_data.as_ptr(), data as *mut u8, DATA_SIZE);
+
+            device.unmap_memory(staging_buffer_memory);
+        }
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_3D)
+            .extent(vk::Extent3D::default().width(4).height(4).depth(4))
+            .mip_levels(1)
+            .array_layers(1)
+            .format(vk::Format::R8_SRGB)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .flags(vk::ImageCreateFlags::empty());
+
+        let image = unsafe {
+            device
+                .create_image(&image_info, None)
+                .expect("Failed to create image")
+        };
+
+        let memory_requirements = unsafe { device.get_image_memory_requirements(image) };
+        let memory_type_index = self.find_memory_type(
+            memory_requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(memory_requirements.size)
+            .memory_type_index(memory_type_index);
+
+        let image_memory = unsafe {
+            device
+                .allocate_memory(&alloc_info, None)
+                .expect("Failed to allocate memory")
+        };
+
+        unsafe {
+            device
+                .bind_image_memory(image, image_memory, 0)
+                .expect("Failed to bind memory");
+        }
+
+        self.transition_image_layout(
+            image,
+            vk::Format::R8_SRGB,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+
+        self.copy_buffer_to_image(staging_buffer, image);
+
+        self.transition_image_layout(
+            image,
+            vk::Format::R8_SRGB,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        unsafe {
+            device.destroy_buffer(staging_buffer, None);
+            device.free_memory(staging_buffer_memory, None);
+        }
+
+        (image, image_memory)
     }
 
     pub fn create_vertex_buffer(&self, verticies: &[Vertex]) -> (vk::Buffer, vk::DeviceMemory) {
@@ -581,6 +736,159 @@ impl RenderContext {
         (buffer, buffer_memory)
     }
 
+    fn copy_buffer_to_image(&self, buffer: vk::Buffer, image: vk::Image) {
+        const DATA_SIZE: usize = 4 * 4 * 4;
+
+        let device = self.device();
+        let command_buffer = self.begin_single_time_commands();
+
+        let image_subresource = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0)
+            .base_array_layer(0)
+            .layer_count(1);
+
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(image_subresource)
+            .image_offset(vk::Offset3D::default().x(0).y(0).z(0))
+            .image_extent(vk::Extent3D::default().width(4).height(4).depth(4));
+
+        unsafe {
+            device.cmd_copy_buffer_to_image(
+                command_buffer,
+                buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+        }
+
+        self.end_single_time_commands(command_buffer);
+    }
+
+    fn transition_image_layout(
+        &self,
+        image: vk::Image,
+        format: vk::Format,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+    ) {
+        let device = self.device();
+        let command_buffer = self.begin_single_time_commands();
+
+        let (src_access_mask, dst_access_mask, source_stage, destination_stage) =
+            match (old_layout, new_layout) {
+                (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                ),
+                (
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                ) => (
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                ),
+                _ => panic!("Unsupported layout transition!"),
+            };
+
+        let subresource_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(subresource_range)
+            .src_access_mask(src_access_mask)
+            .dst_access_mask(dst_access_mask);
+
+        unsafe {
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                source_stage,
+                destination_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+        self.end_single_time_commands(command_buffer);
+    }
+
+    pub fn begin_single_time_commands(&self) -> vk::CommandBuffer {
+        let device = self.device();
+
+        let command_buffer = {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_pool(self.command_pool)
+                .command_buffer_count(1);
+
+            unsafe {
+                self.device
+                    .allocate_command_buffers(&alloc_info)
+                    .expect("Failed to allocate command buffer")
+                    .into_iter()
+                    .next()
+                    .expect("At least one command buffer should be created")
+            }
+        };
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe {
+            device
+                .begin_command_buffer(command_buffer, &begin_info)
+                .expect("Failed to begin command buffer");
+        }
+
+        command_buffer
+    }
+
+    pub fn end_single_time_commands(&self, command_buffer: vk::CommandBuffer) {
+        let device = self.device();
+
+        unsafe {
+            device
+                .end_command_buffer(command_buffer)
+                .expect("Failed to end command buffer")
+        }
+
+        let command_buffers = &[command_buffer];
+        let submit_info = vk::SubmitInfo::default().command_buffers(command_buffers);
+        unsafe {
+            device
+                .queue_submit(self.graphics_queue, &[submit_info], vk::Fence::null())
+                .expect("Failed to submit to queue");
+        }
+
+        unsafe {
+            device
+                .queue_wait_idle(self.graphics_queue)
+                .expect("Failed to wait for queue")
+        }
+
+        unsafe {
+            device.free_command_buffers(self.command_pool, &[command_buffer]);
+        }
+    }
+
     fn find_memory_type(&self, type_filter: u32, properties: vk::MemoryPropertyFlags) -> u32 {
         let mem_properties = unsafe {
             self.instance
@@ -668,7 +976,7 @@ fn is_device_suitable(instance: &Instance, device: vk::PhysicalDevice) -> bool {
     let device_properties = unsafe { instance.get_physical_device_properties(device) };
     let device_features = unsafe { instance.get_physical_device_features(device) };
 
-    device_properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
+    device_properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
         && device_features.geometry_shader == 1
 }
 
