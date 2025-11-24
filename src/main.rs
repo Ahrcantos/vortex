@@ -1,6 +1,8 @@
 mod frame;
 mod render_context;
 mod vertex;
+mod voxel_object;
+mod render;
 
 use core::f32;
 use std::{

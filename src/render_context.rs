@@ -14,7 +14,7 @@ pub struct RenderContext {
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
 
-    command_pool: vk::CommandPool, // A command pool is tied to a specific queue family?
+    command_pool: vk::CommandPool, // A command pool is tied to a specific queue family? New command pool per render pass?
 
     // I think for these there can be multiple? Better to tie them to a different structure
     pipeline: vk::Pipeline,
@@ -144,11 +144,11 @@ impl RenderContext {
 
         let descriptor_pool = {
             let ubo_pool_size = vk::DescriptorPoolSize::default()
-                .descriptor_count(2)
+                .descriptor_count(1024) // was 2
                 .ty(vk::DescriptorType::UNIFORM_BUFFER);
 
             let sampler_pool_size = vk::DescriptorPoolSize::default()
-                .descriptor_count(2)
+                .descriptor_count(1024)
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER);
 
             let pool_sizes = &[ubo_pool_size, sampler_pool_size];
