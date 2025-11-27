@@ -1,8 +1,4 @@
-use std::ffi::{CString, c_char, c_void};
-
-use ash::{Device, Entry, Instance, vk};
-use winit::{event_loop::EventLoop, raw_window_handle::HasDisplayHandle};
-
+use std::ffi::{CString, c_char, c_void}; use ash::{Device, Entry, Instance, vk}; use winit::{event_loop::EventLoop, raw_window_handle::HasDisplayHandle};
 use crate::{UniformBufferObject, vertex::Vertex};
 
 pub struct RenderContext {

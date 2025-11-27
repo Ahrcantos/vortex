@@ -2,13 +2,13 @@ use ash::{vk, Device};
 
 use crate::render_context::RenderContext;
 
-struct VoxelMaterialPipeline {
-    pipeline: vk::Pipeline,
-    layout: vk::PipelineLayout,
-    pass: vk::RenderPass,
-    descriptor: vk::DescriptorSet,
-    descriptor_set_layout: vk::DescriptorSetLayout,
+pub struct VoxelMaterialPipeline {
+    pub pipeline: vk::Pipeline,
+    pub layout: vk::PipelineLayout,
+    pub pass: vk::RenderPass,
+    pub descriptor_set_layout: vk::DescriptorSetLayout,
 }
+
 
 impl VoxelMaterialPipeline {
     pub fn new(render_context: &RenderContext) -> Self {
@@ -37,8 +37,8 @@ impl VoxelMaterialPipeline {
         let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
             .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]);
 
-        let binding_descriptions = &[Vertex::get_binding_description()];
-        let attribute_descriptions = Vertex::get_attribute_descriptions();
+        let binding_descriptions = &[VoxelVertex::get_binding_description()];
+        let attribute_descriptions = VoxelVertex::get_attribute_descriptions();
 
         let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(binding_descriptions)
@@ -79,6 +79,31 @@ impl VoxelMaterialPipeline {
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
             .attachments(color_blend_attachments);
+
+
+        let descriptor_set_layout = {
+            let ubo_layout_binding = vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX);
+
+            let sampler_layout_binding = vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+            let bindings = &[ubo_layout_binding, sampler_layout_binding];
+
+            let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(bindings);
+
+            unsafe {
+                device
+                    .create_descriptor_set_layout(&create_info, None)
+                    .expect("Failed to create descriptor set layout")
+            }
+        };
 
         let set_layouts = &[descriptor_set_layout];
 
@@ -172,7 +197,6 @@ impl VoxelMaterialPipeline {
             pipeline,
             layout: pipeline_layout,
             pass: render_pass,
-            descriptor,
             descriptor_set_layout,
         }
     }
@@ -202,4 +226,31 @@ fn create_shader_module(device: &Device, code: &[u8]) -> vk::ShaderModule {
     };
 
     shader_module
+}
+
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct VoxelVertex {
+    pub pos: [u8; 3]
+}
+
+impl VoxelVertex {
+    pub const fn get_binding_description() -> vk::VertexInputBindingDescription {
+        vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: 3,
+            input_rate: vk::VertexInputRate::VERTEX
+        }
+    }
+
+    pub const fn get_attribute_descriptions() -> &'static [vk::VertexInputAttributeDescription] {
+        &[
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 0,
+                format: vk::Format::R8G8B8_UINT,
+                offset: 3,
+            }
+        ]
+    }
 }
